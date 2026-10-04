@@ -1,5 +1,5 @@
 {
-  "_comment": "Default-deny (EPERM) seccomp whitelist for OJ judge containers. The allow list is the empirical union of every syscall observed while compiling AND running all supported judge languages (C/C++ via ccache, Rust, Go, asm, Java, Kotlin, Python, Node, Ruby), including ojrun/GNU-time wrappers, tini, coreutils timeout, the interactive FIFO wrapper and the pool sanitiser; a small set of safe family-companion syscalls is added on top. Extend the list only after re-tracing with `strace -f` (plain, no class filters) under the production container flags. amd64/x32 only (judge images are amd64).",
+  "_comment": "Default-deny (EPERM) seccomp whitelist applied AT CONTAINER CREATION to every OJ judge container (pool and one-shot). A judge container always hosts a compile step, so this is the COMPILE-phase superset: the empirical union of every syscall observed while compiling AND running all supported judge languages (C/C++ via ccache, Rust, Go, asm, Java, Kotlin, Python, Node, Ruby), including ojrun/GNU-time wrappers, tini, coreutils timeout, the interactive FIFO wrapper and the pool sanitiser, plus safe family companions. The execute phase is additionally locked down INSIDE the container by ojsec, which installs seccomp-execute.json as a stacked secondary filter before exec'ing untrusted code; 'seccomp' is therefore allowed here (a process may only add stricter filters for itself). Extend the list only after re-tracing with `strace -f` (plain, no class filters) under the production container flags. amd64/x32 only (judge images are amd64).",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
   "architectures": [
@@ -129,6 +129,7 @@
         "rt_sigtimedwait",
         "sched_getaffinity",
         "sched_yield",
+        "seccomp",
         "select",
         "semctl",
         "semget",

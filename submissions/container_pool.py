@@ -466,8 +466,9 @@ class ContainerPool:
                 str(host_root),
                 _memory_mb(),
                 image,
-                # Compile seccomp profile is the superset; pooled containers
-                # serve both compile and execute steps.
+                # Containers start with the compile seccomp superset; the
+                # execute phase is tightened inside by the ojsec launcher
+                # (stacked filter) prepended by SandboxRunner._timed_command.
                 is_compile=True,
                 labels=labels,
                 use_init=True,

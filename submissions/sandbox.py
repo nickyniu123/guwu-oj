@@ -256,10 +256,16 @@ def _runtime_user_flags():
     return ["--user", f"{uid}:{gid}"]
 
 
-def _seccomp_flag(is_compile):
+def _seccomp_profile_path():
+    """Container-creation seccomp profile (the compile-phase superset).
+
+    Every judge container hosts a compile step, so containers always start
+    with the compile profile; the execute phase is narrowed *inside* the
+    container by the ojsec launcher (see docker/judge/ojsec.c), which stacks
+    seccomp-execute.json on top before exec'ing submitted code.
+    """
     base_dir = Path(__file__).resolve().parent.parent
-    profile = "seccomp-compile.json" if is_compile else "seccomp-execute.json"
-    return str(base_dir / "docker" / "judge" / profile)
+    return str(base_dir / "docker" / "judge" / "seccomp-compile.json")
 
 
 def _apparmor_flag():
@@ -335,6 +341,8 @@ def exit_indicates_memory_limit(returncode):
 
 # Path ojrun is mounted at inside judge containers (see below).
 OJRUN_CONTAINER_PATH = "/opt/oj/ojrun"
+# Path of the execute-phase seccomp launcher (same read-only bind mount).
+OJSEC_CONTAINER_PATH = "/opt/oj/ojsec"
 
 
 def ojrun_host_dir():
@@ -399,7 +407,7 @@ def build_judge_run_args(
         *_io_flags(),
         *_cpu_flags(),
         "--security-opt", "no-new-privileges=true",
-        "--security-opt", f"seccomp={_seccomp_flag(is_compile)}",
+        "--security-opt", f"seccomp={_seccomp_profile_path()}",
         "--cap-drop", "ALL",
         "--read-only",
         "--security-opt", f"apparmor={_apparmor_flag()}",

@@ -51,6 +51,7 @@ from .models import Submission, SubmissionTestResult
 from .sandbox import (
     CCACHE_IMAGES,
     OJRUN_CONTAINER_PATH,
+    OJSEC_CONTAINER_PATH,
     DockerNotAvailableError,
     JudgeContainer,
     ccache_dir,
@@ -160,8 +161,9 @@ def _clean_kotlin_output(text):
 _pch_available_cache = {}
 _c_pch_available_cache = {}
 
-# Per-container probe results for the ojrun timer mount (keyed by cid).
-_ojrun_available_cache = {}
+# Per-container probe results for the read-only /opt/oj tool mount, keyed by
+# cid: (ojrun_present, ojsec_present).
+_ojbin_tools_cache = {}
 
 
 def _pch_include_flags(runner, image):
@@ -317,27 +319,40 @@ class SandboxRunner:
                 )
         return elapsed_ms, memory_kb
 
-    def _ojrun_available(self):
-        # The ojrun timer (bind-mounted at container creation) is preferred
-        # over GNU time: microsecond wall-clock resolution instead of the
-        # 10 ms granularity of `%e`. Probe once per container — a pool
-        # container created before the binary was deployed has no mount, so
-        # a per-process cache keyed by cid keeps those containers on the
-        # /usr/bin/time fallback instead of failing every test case.
+    def _ojbin_tools(self):
+        # Probe the read-only /opt/oj mount once per container. A pool
+        # container created before the binaries were deployed has no mount,
+        # so the caches keep those containers on fallbacks instead of
+        # failing every test case. Returns (ojrun_present, ojsec_present):
+        # ojrun gives microsecond timing (vs GNU time's 10 ms `%e`); ojsec
+        # stacks the tightened execute-phase seccomp filter around whatever
+        # timer is used.
         cid = getattr(self._container, "cid", None)
         if not cid:
-            return False
-        if cid not in _ojrun_available_cache:
-            if len(_ojrun_available_cache) > 512:
-                _ojrun_available_cache.clear()
+            return (False, False)
+        if cid not in _ojbin_tools_cache:
+            if len(_ojbin_tools_cache) > 512:
+                _ojbin_tools_cache.clear()
             try:
                 probe = self._container.exec(
-                    ["/usr/bin/test", "-x", OJRUN_CONTAINER_PATH], 5
+                    ["/bin/sh", "-c",
+                     f"test -x {OJRUN_CONTAINER_PATH}; echo $?; "
+                     f"test -x {OJSEC_CONTAINER_PATH}; echo $?"],
+                    5,
                 )
-                _ojrun_available_cache[cid] = probe.returncode == 0
+                lines = (probe.stdout or "").split()
+                ojrun_ok = len(lines) > 0 and lines[0] == "0"
+                ojsec_ok = len(lines) > 1 and lines[1] == "0"
+                _ojbin_tools_cache[cid] = (ojrun_ok, ojsec_ok)
             except Exception:
-                _ojrun_available_cache[cid] = False
-        return _ojrun_available_cache[cid]
+                _ojbin_tools_cache[cid] = (False, False)
+        return _ojbin_tools_cache[cid]
+
+    def _ojrun_available(self):
+        return self._ojbin_tools()[0]
+
+    def _ojsec_available(self):
+        return self._ojbin_tools()[1]
 
     def _timed_command(self, cmd):
         # Call the timer directly instead of wrapping in `bash -lc`.
@@ -346,9 +361,19 @@ class SandboxRunner:
         # short cases that overhead dominated the test phase. The timer
         # execs the program directly, and stdin flows through
         # `docker exec -i` unchanged.
+        #
+        # When ojsec is mounted it is prepended as the outermost layer: it
+        # installs the execute seccomp whitelist and execs the timer, so the
+        # submitted program (and every descendant, incl. interactive shell
+        # wrappers) runs under the intersection of container + execute
+        # filters.
         if self._ojrun_available():
-            return [OJRUN_CONTAINER_PATH, *cmd]
-        return ["/usr/bin/time", "-f", "OJ_TIME %M %e", *cmd]
+            inner = [OJRUN_CONTAINER_PATH, *cmd]
+        else:
+            inner = ["/usr/bin/time", "-f", "OJ_TIME %M %e", *cmd]
+        if self._ojsec_available():
+            return [OJSEC_CONTAINER_PATH, *inner]
+        return inner
 
     # ── low-level runner ────────────────────────────────────────────────
 

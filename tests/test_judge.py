@@ -139,29 +139,59 @@ class TimedCommandSelectionTests(TestCase):
         import submissions.judge as judge
         from submissions.judge import SandboxRunner
 
-        judge._ojrun_available_cache.clear()
+        judge._ojbin_tools_cache.clear()
         runner = SandboxRunner.__new__(SandboxRunner)
         runner._container = container
         return runner
 
-    def test_uses_ojrun_when_probe_succeeds(self):
+    def test_uses_ojrun_and_ojsec_when_probe_succeeds(self):
         container = SimpleNamespace(
             cid="c1",
-            exec=MagicMock(return_value=SimpleNamespace(returncode=0)),
+            exec=MagicMock(return_value=SimpleNamespace(
+                returncode=0, stdout="0\n0\n", stderr="")),
+        )
+        runner = self._runner(container)
+
+        command = runner._timed_command(["./main"])
+        self.assertEqual(
+            command,
+            ["/opt/oj/ojsec", "/opt/oj/ojrun", "./main"],
+        )
+
+        # The probe result is cached per container: no second exec.
+        runner._timed_command(["./main"])
+        self.assertEqual(container.exec.call_count, 1)
+
+    def test_ojsec_wraps_gnu_time_fallback_when_only_ojrun_missing(self):
+        container = SimpleNamespace(
+            cid="c3",
+            exec=MagicMock(return_value=SimpleNamespace(
+                returncode=0, stdout="1\n0\n", stderr="")),
+        )
+        runner = self._runner(container)
+
+        command = runner._timed_command(["./main"])
+        self.assertEqual(
+            command,
+            ["/opt/oj/ojsec", "/usr/bin/time", "-f", "OJ_TIME %M %e", "./main"],
+        )
+
+    def test_no_ojsec_but_ojrun_present(self):
+        container = SimpleNamespace(
+            cid="c4",
+            exec=MagicMock(return_value=SimpleNamespace(
+                returncode=0, stdout="0\n1\n", stderr="")),
         )
         runner = self._runner(container)
 
         command = runner._timed_command(["./main"])
         self.assertEqual(command, ["/opt/oj/ojrun", "./main"])
 
-        # The probe result is cached per container: no second exec.
-        runner._timed_command(["./main"])
-        self.assertEqual(container.exec.call_count, 1)
-
     def test_falls_back_to_gnu_time_when_probe_fails(self):
         container = SimpleNamespace(
             cid="c2",
-            exec=MagicMock(return_value=SimpleNamespace(returncode=1)),
+            exec=MagicMock(return_value=SimpleNamespace(
+                returncode=1, stdout="1\n1\n", stderr="")),
         )
         runner = self._runner(container)
 
