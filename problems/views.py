@@ -1,7 +1,10 @@
 import re
+import uuid
 
 from django.conf import settings
+from django.core.files.storage import default_storage
 from django.db.models.functions import Cast, RowNumber
+from django.http import JsonResponse
 from django.shortcuts import render, get_object_or_404, redirect
 from django.contrib.auth.decorators import login_required
 from django.contrib import messages
@@ -412,6 +415,60 @@ def create_problem(request):
         form = ProblemForm()
 
     return render(request, 'problems/create_problem.html', {'form': form})
+
+
+# Max size of a problem-statement image (2 MiB). Large diagrams should be
+# vectorised or split; keeping this bound avoids disk blow-ups from a single
+# problem author.
+_PROBLEM_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+# PIL format -> saved file extension. The extension drives the served
+# Content-Type, so it must reflect the *verified* format rather than the
+# uploader's claimed filename.
+_PIL_EXT = {'PNG': 'png', 'JPEG': 'jpg', 'GIF': 'gif', 'WEBP': 'webp', 'BMP': 'bmp'}
+
+
+@login_required
+@require_POST
+def upload_problem_image(request):
+    """Upload an image for embedding in a problem's Markdown statement.
+
+    Returns JSON: ``{"ok": true, "url": "/media/problem-images/..."}`` on
+    success, or ``{"ok": false, "message": "..."}`` with a 4xx status.
+
+    Security model:
+      * ``login_required`` + ``require_POST`` — only authenticated authors.
+      * The file must be a real raster image (PIL opens + verifies); the
+        saved extension comes from PIL's detected format, so the served
+        Content-Type cannot be spoofed by a forged filename.
+      * A 2 MiB cap bounds per-upload disk use.
+    """
+    upload = request.FILES.get('image') or request.FILES.get('file')
+    if upload is None:
+        return JsonResponse({'ok': False, 'message': '未收到图片文件。'}, status=400)
+    if upload.size > _PROBLEM_IMAGE_MAX_BYTES:
+        return JsonResponse({'ok': False, 'message': '图片不能超过 2 MB。'}, status=400)
+
+    try:
+        from PIL import Image
+        img = Image.open(upload)
+        fmt = img.format
+        img.verify()
+    except Exception:
+        return JsonResponse({'ok': False, 'message': '文件不是有效的图片。'}, status=400)
+
+    ext = _PIL_EXT.get(fmt or '')
+    if not ext:
+        return JsonResponse(
+            {'ok': False, 'message': '不支持的图片格式，请使用 PNG / JPG / GIF / WebP。'},
+            status=400,
+        )
+
+    # verify() consumes the file pointer; reset so default_storage reads the
+    # original bytes from the start.
+    upload.seek(0)
+    rel_path = f'problem-images/{request.user.id}/{uuid.uuid4().hex}.{ext}'
+    saved_name = default_storage.save(rel_path, upload)
+    return JsonResponse({'ok': True, 'url': default_storage.url(saved_name)})
 
 
 # The expensive aggregate query is cached below, but the rendered page is

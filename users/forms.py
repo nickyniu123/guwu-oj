@@ -1,4 +1,5 @@
 from django import forms
+from django.conf import settings
 from django.contrib.auth.forms import UserCreationForm, SetPasswordForm, AuthenticationForm
 from django.core.exceptions import ValidationError
 from PIL import Image
@@ -444,21 +445,34 @@ class UserUpdateForm(forms.ModelForm):
         return avatar
 
     def save(self, commit=True):
-        from .models import AvatarBlob
-
         user = super().save(commit=False)
         avatar = self.cleaned_data.get('avatar')
 
         if avatar is False:
+            # Explicit removal — clear both representations so they cannot
+            # disagree about whether the user still has an avatar.
+            if user.avatar:
+                user.avatar.delete(save=False)
+                user.avatar = None
             AvatarBlob.objects.filter(user=user).delete()
         elif avatar:
-            avatar.seek(0)
-            data = avatar.read()
-            content_type = getattr(avatar, 'content_type', 'image/jpeg')
-            AvatarBlob.objects.update_or_create(
-                user=user,
-                defaults={'content_type': content_type, 'data': data},
-            )
+            if settings.R2_ENABLED:
+                # Object storage: the avatar becomes a plain public CDN URL
+                # served directly by Cloudflare (see User.avatar_url), so the
+                # captcha-gated ``avatar`` view is no longer involved.
+                avatar.seek(0)
+                user.avatar.save(avatar.name, avatar, save=False)
+                AvatarBlob.objects.filter(user=user).delete()
+            else:
+                # Legacy path: keep the bytes in Postgres, served by the
+                # rate-limited ``avatar`` view.
+                avatar.seek(0)
+                data = avatar.read()
+                content_type = getattr(avatar, 'content_type', 'image/jpeg')
+                AvatarBlob.objects.update_or_create(
+                    user=user,
+                    defaults={'content_type': content_type, 'data': data},
+                )
 
         if commit:
             user.save()

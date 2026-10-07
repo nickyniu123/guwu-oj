@@ -5,6 +5,7 @@
 
 {% block extra_css %}
 <link rel="stylesheet" href="{% static 'css/problem-create.css' %}?v=20260913">
+<link rel="stylesheet" href="{% static 'css/md-toolbar-v2.css' %}?v=20261007">
 {% endblock %}
 
 {% block content %}
@@ -128,5 +129,17 @@
 {% endblock %}
 
 {% block extra_js %}
+<script src="{% static 'js/md-toolbar.js' %}?v=20261006"></script>
 <script src="{% static 'js/problem-create.js' %}?v=2026092401"></script>
+<script>
+    // Markdown + LaTeX 工具栏：挂到所有 md-editor 文本域（描述/输入输出格式/提示），
+    // 样例输入输出保持纯文本，不挂工具栏。
+    (function () {
+        var token = document.querySelector('[name=csrfmiddlewaretoken]');
+        MdToolbar.csrfToken = token ? token.value : '';
+        document.querySelectorAll('textarea.md-editor').forEach(function (ta) {
+            new MdToolbar(ta, { uploadUrl: "{% url 'upload_problem_image' %}" });
+        });
+    })();
+</script>
 {% endblock %}

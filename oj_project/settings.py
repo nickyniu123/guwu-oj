@@ -605,6 +605,56 @@ STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_DIRS = [BASE_DIR / 'static']
 
+# Problem-statement images uploaded from the create-problem editor. Served
+# in dev via urls.py +static(); in production nginx should alias /media/ to
+# MEDIA_ROOT (the same way /static/ is aliased to staticfiles).
+#
+# When R2 is enabled (below) both problem images and user avatars are written
+# to Cloudflare R2 instead, and nginx's /media/ alias becomes unused.
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
+# ---------------------------------------------------------------------------
+# Cloudflare R2 object storage (problem images + user avatars)
+# ---------------------------------------------------------------------------
+# R2 is an S3-compatible object store.  When the R2_* variables are present,
+# ``default_storage`` is repointed at the bucket and every media URL becomes a
+# public CDN URL served through the bucket's custom domain.  When they are
+# absent the app transparently keeps using local filesystem storage, so
+# development and the test suite need no credentials.
+#
+# These are populated by ``scripts/setup_r2.sh`` after R2 is activated on the
+# Cloudflare account (activation itself is dashboard-only).
+R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID', '')
+R2_BUCKET = os.environ.get('R2_BUCKET', '')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY', '')
+R2_CUSTOM_DOMAIN = os.environ.get('R2_CUSTOM_DOMAIN', '')
+R2_ENDPOINT_URL = os.environ.get(
+    'R2_ENDPOINT_URL',
+    f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com' if R2_ACCOUNT_ID else '',
+)
+
+R2_ENABLED = bool(
+    R2_BUCKET and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_ENDPOINT_URL
+)
+
+if R2_ENABLED:
+    STORAGES = {
+        'default': {'BACKEND': 'oj_project.storage.R2MediaStorage'},
+        # Defining STORAGES replaces Django's entire default mapping, so the
+        # staticfiles backend must be restated or WhiteNoise loses its source
+        # of truth for collectstatic / {% static %} lookups.
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    }
+    if R2_CUSTOM_DOMAIN:
+        # MEDIA_URL is only a fallback here — R2MediaStorage.url() builds
+        # absolute CDN URLs from the bucket's custom domain — but several
+        # templates and the dev static() helper read it directly.
+        MEDIA_URL = f'https://{R2_CUSTOM_DOMAIN}/'
+
 WHITENOISE_ROOT = BASE_DIR / 'static'
 WHITENOISE_USE_FINDERS = True
 WHITENOISE_AUTOREFRESH = True

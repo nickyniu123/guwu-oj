@@ -1,4 +1,5 @@
 import secrets
+from pathlib import Path
 
 from django.contrib.auth.models import AbstractUser
 from django.core.cache import cache
@@ -13,11 +14,37 @@ def avatar_upload_to(instance, filename):
     """Legacy upload path retained for historical migrations."""
     return f'avatars/{instance.username}/{filename}'
 
+
+# Image extensions considered safe to keep verbatim in a generated key. The
+# upload form already verifies the bytes with PIL, so this is only a guard
+# against a spoofed filename landing in an unexpected object key.
+_AVATAR_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+
+
+def avatar_object_key(instance, filename):
+    """Object key for a newly uploaded avatar.
+
+    A random suffix keeps every upload at a distinct key, which both avoids
+    collisions between users and makes the published URL change on each
+    update — so a browser (or the CDN) never serves a stale cached avatar.
+    """
+    ext = Path(filename).suffix.lower()
+    if ext not in _AVATAR_EXTENSIONS:
+        ext = '.jpg'
+    owner = instance.pk or instance.username
+    return f'avatars/{owner}/{secrets.token_hex(8)}{ext}'
+
+
 class User(AbstractUser):
     email = models.EmailField(_('email address'), blank=True, unique=True)
     nickname = models.CharField(max_length=50, blank=True)
     bio = models.TextField(max_length=500, blank=True)
-    avatar = models.ImageField(blank=True, null=True)
+    # Avatar bytes live in object storage (Cloudflare R2 in production, the
+    # local media directory otherwise). Users whose avatar predates the R2
+    # migration still have their bytes in Postgres via ``AvatarBlob`` and keep
+    # being served by the ``avatar`` view until ``migrate_media_to_r2`` moves
+    # them.
+    avatar = models.ImageField(blank=True, null=True, upload_to=avatar_object_key)
     # Django's implicit through model has indexed foreign keys and a unique
     # composite constraint, which supports leaderboard counts and duplicate-safe
     # `get_or_create` calls without a custom through model.
@@ -211,18 +238,31 @@ class User(AbstractUser):
 
     @property
     def has_avatar(self) -> bool:
-        return hasattr(self, 'avatar_blob')
-
+        return bool(self.avatar) or hasattr(self, 'avatar_blob')
 
     @property
     def avatar_url(self):
-        if self.has_avatar:
+        """Public URL for the avatar, or ``None`` when the user has none."""
+        if self.avatar:
+            return self.avatar.url
+        if hasattr(self, 'avatar_blob'):
             base = reverse('avatar', kwargs={'username': self.username})
             # Append a cache-busting timestamp so browsers fetch a fresh image
             # whenever the avatar is updated (the URL itself is otherwise stable).
             ts = int(self.avatar_blob.updated_at.timestamp())
             return f'{base}?v={ts}'
         return None
+
+    @property
+    def avatar_is_legacy_blob(self) -> bool:
+        """True when the avatar bytes still live in Postgres (``AvatarBlob``).
+
+        Those are served by the captcha-gated ``avatar`` view and must be
+        loaded by ``avatar-captcha.js`` through ``data-avatar-url``.
+        Object-storage-backed avatars are plain public URLs, so templates can
+        point an ``<img src>`` straight at them.
+        """
+        return not self.avatar and hasattr(self, 'avatar_blob')
 
     def save(self, *args, **kwargs):
         if not self.referral_code:

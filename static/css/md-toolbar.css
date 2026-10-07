@@ -1,0 +1,134 @@
+/* Markdown + LaTeX toolbar for problem-statement textareas */
+.md-toolbar-wrapper {
+    border: 1px solid #dee2e6;
+    border-radius: 0.375rem;
+    overflow: hidden;
+    background: #fff;
+}
+
+.md-toolbar-wrapper textarea {
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}
+
+.md-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 4px 6px;
+    background: #f8f9fa;
+    border-bottom: 1px solid #dee2e6;
+}
+
+.md-toolbar-group {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 1px;
+    padding: 0 4px;
+    border-right: 1px solid #e9ecef;
+}
+
+.md-toolbar-group:last-child {
+    border-right: none;
+}
+
+.md-toolbar-btn {
+    min-width: 28px;
+    height: 28px;
+    padding: 0 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    border-radius: 4px;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    color: #495057;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.md-toolbar-btn:hover {
+    background: #e9ecef;
+    border-color: #ced4da;
+    color: #212529;
+}
+
+.md-toolbar-btn:active {
+    background: #dee2e6;
+}
+
+/* image upload modal */
+.md-toolbar-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1080;
+    display: none;
+    align-items: center;
+    justify-content: center;
+}
+
+.md-toolbar-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+}
+
+.md-toolbar-modal-dialog {
+    position: relative;
+    width: 90%;
+    max-width: 460px;
+    background: #fff;
+    border-radius: 0.5rem;
+    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.3);
+    overflow: hidden;
+}
+
+.md-toolbar-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #dee2e6;
+}
+
+.md-toolbar-close {
+    background: none;
+    border: none;
+    font-size: 1.5rem;
+    line-height: 1;
+    color: #6c757d;
+    cursor: pointer;
+    padding: 0 4px;
+}
+
+.md-toolbar-close:hover {
+    color: #212529;
+}
+
+.md-toolbar-modal-body {
+    padding: 1.25rem 1rem;
+}
+
+.md-toolbar-dropzone {
+    border: 2px dashed #adb5bd;
+    border-radius: 0.5rem;
+    padding: 2rem 1rem;
+    text-align: center;
+    cursor: pointer;
+    color: #6c757d;
+    transition: all 0.15s;
+}
+
+.md-toolbar-dropzone:hover,
+.md-toolbar-dropzone.drag-over {
+    border-color: #0d6efd;
+    background: #f0f7ff;
+    color: #0d6efd;
+}
+
+.md-toolbar-dropzone p {
+    margin: 0.4rem 0 0;
+}

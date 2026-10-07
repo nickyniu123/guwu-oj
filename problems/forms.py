@@ -14,12 +14,12 @@ class ProblemForm(forms.ModelForm):
         ]
         widgets = {
             'title': forms.TextInput(attrs={'class': 'form-control'}),
-            'description': forms.Textarea(attrs={'class': 'form-control', 'rows': 8}),
-            'input_format': forms.Textarea(attrs={'class': 'form-control', 'rows': 4}),
-            'output_format': forms.Textarea(attrs={'class': 'form-control', 'rows': 4}),
+            'description': forms.Textarea(attrs={'class': 'form-control md-editor', 'rows': 8}),
+            'input_format': forms.Textarea(attrs={'class': 'form-control md-editor', 'rows': 4}),
+            'output_format': forms.Textarea(attrs={'class': 'form-control md-editor', 'rows': 4}),
             'sample_input': forms.Textarea(attrs={'class': 'form-control', 'rows': 3}),
             'sample_output': forms.Textarea(attrs={'class': 'form-control', 'rows': 3}),
-            'hint': forms.Textarea(attrs={'class': 'form-control', 'rows': 3}),
+            'hint': forms.Textarea(attrs={'class': 'form-control md-editor', 'rows': 3}),
             'difficulty': forms.Select(attrs={'class': 'form-select'}),
             'time_limit': forms.NumberInput(attrs={
                 'class': 'form-control',
@@ -34,6 +34,23 @@ class ProblemForm(forms.ModelForm):
         help_texts = {
             'time_limit': '单位：毫秒（例如 1000 表示 1 秒）',
             'memory_limit': '单位：MB',
+        }
+
+
+class ProblemAdminForm(forms.ModelForm):
+    """Admin 后台用表单：仅给题面 Markdown 字段挂上 md-editor 类以启用工具栏。
+
+    样例输入/输出、function_files、interactive_config 保持纯文本。
+    保留 Django admin 默认的 vLargeTextField 类以维持后台文本域尺寸。
+    """
+    class Meta:
+        model = Problem
+        fields = '__all__'
+        widgets = {
+            'description': forms.Textarea(attrs={'class': 'vLargeTextField md-editor', 'rows': 8}),
+            'input_format': forms.Textarea(attrs={'class': 'vLargeTextField md-editor', 'rows': 4}),
+            'output_format': forms.Textarea(attrs={'class': 'vLargeTextField md-editor', 'rows': 4}),
+            'hint': forms.Textarea(attrs={'class': 'vLargeTextField md-editor', 'rows': 3}),
         }
 
 

@@ -45,3 +45,10 @@ urlpatterns = [
     path('privacy-policy/', TemplateView.as_view(template_name='legal/privacy_policy.html'), name='privacy_policy'),
     path('terms-of-service/', TemplateView.as_view(template_name='legal/terms_of_service.html'), name='terms_of_service'),
 ]
+
+# Media files (problem images) — only active in DEBUG, and only when media is
+# served locally.  When R2 is enabled MEDIA_URL is an absolute CDN URL (and
+# MEDIA_ROOT is unused), which static() cannot serve.  In production nginx
+# aliases /media/ directly to MEDIA_ROOT, so Django never sees these.
+if settings.DEBUG and not settings.R2_ENABLED:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

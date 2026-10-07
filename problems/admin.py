@@ -7,7 +7,7 @@ from django.urls import path
 
 from ai_assistant.deepseek_api import DeepSeekError
 
-from .forms import save_test_cases
+from .forms import ProblemAdminForm, save_test_cases
 from .luogu import LuoguFetchError, fetch_luogu_problem, normalize_pid
 from .models import Problem, TestCase, Solution
 from .tag_complete import (
@@ -70,6 +70,11 @@ class ProblemAdmin(admin.ModelAdmin):
     )
     inlines = [TestCaseInline]
     change_list_template = 'admin/problems/problem/change_list.html'
+    form = ProblemAdminForm
+
+    class Media:
+        css = {'all': ('css/md-toolbar-v2.css',)}
+        js = ('js/md-toolbar.js', 'js/md-toolbar-admin-init.js')
 
     def get_urls(self):
         urls = super().get_urls()
