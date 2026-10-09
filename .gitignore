@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 *.pyc
 __pycache__/
 venv/
@@ -9,6 +11,7 @@ db.sqlite3
 server.crt
 server.key
 staticfiles
+media/
 .idea
 dump.rdb
 config.yaml
@@ -45,3 +48,8 @@ tests/test_problem_tags.py
 
 # SSL certs / private keys (do not commit)
 certs/
+logs/
+ojdb_2026-09-16/
+main.java
+ac.cpp
+backup.sh

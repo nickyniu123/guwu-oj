@@ -1,4 +1,5 @@
 from django import forms
+from django.conf import settings
 from django.contrib.auth.forms import UserCreationForm, SetPasswordForm, AuthenticationForm
 from django.core.exceptions import ValidationError
 from PIL import Image
@@ -175,9 +176,18 @@ class UserRegisterForm(UserCreationForm, CaptchaMixin):
     # ----- Standard clean hooks -----
     def clean_email(self):
         email = self.cleaned_data['email'].strip().lower()
+        # When the captcha is enabled, defer the uniqueness check to
+        # ``clean`` so a wrong captcha is reported FIRST and the "email
+        # already registered" signal cannot be used to enumerate accounts
+        # without solving the captcha.
+        if 'captcha_id' not in self.fields:
+            self._check_email_unique(email)
+        return email
+
+    @staticmethod
+    def _check_email_unique(email):
         if User.objects.filter(email__iexact=email).exists():
             raise ValidationError('该邮箱已被注册。')
-        return email
 
     def clean_referral_code(self):
         referral_code = self.cleaned_data['referral_code'].strip()
@@ -199,8 +209,41 @@ class UserRegisterForm(UserCreationForm, CaptchaMixin):
 
     def clean(self):
         cleaned_data = super().clean()
+        # Captcha failure raises here and takes priority over every other
+        # validation error, including email uniqueness (see clean_email).
         self.clean_captcha()
+        if 'captcha_id' in self.fields:
+            email = cleaned_data.get('email')
+            if email:
+                try:
+                    self._check_email_unique(email)
+                except ValidationError as exc:
+                    self.add_error('email', exc)
         return cleaned_data
+
+    def full_clean(self):
+        super().full_clean()
+        # After all validation (including model-level unique constraints run
+        # by ModelForm._post_clean), if the captcha is enabled but failed,
+        # strip email-uniqueness errors so they cannot be used to enumerate
+        # accounts without solving the captcha first.  Non-uniqueness email
+        # errors (e.g. format) are preserved.
+        if 'captcha_id' in self.fields and self.errors:
+            has_captcha_error = (
+                'captcha_answer' in self.errors
+                or 'altcha' in self.errors
+                or '__all__' in self.errors
+            )
+            if has_captcha_error and 'email' in self.errors:
+                kept = [
+                    e for e in self.errors['email']
+                    if '已存在' not in str(e) and '已注册' not in str(e)
+                ]
+                if kept:
+                    self.errors['email'] = kept
+                else:
+                    self.errors.pop('email', None)
+
 
     def save(self, commit=True):
         user = super().save(commit=False)
@@ -402,21 +445,34 @@ class UserUpdateForm(forms.ModelForm):
         return avatar
 
     def save(self, commit=True):
-        from .models import AvatarBlob
-
         user = super().save(commit=False)
         avatar = self.cleaned_data.get('avatar')
 
         if avatar is False:
+            # Explicit removal — clear both representations so they cannot
+            # disagree about whether the user still has an avatar.
+            if user.avatar:
+                user.avatar.delete(save=False)
+                user.avatar = None
             AvatarBlob.objects.filter(user=user).delete()
         elif avatar:
-            avatar.seek(0)
-            data = avatar.read()
-            content_type = getattr(avatar, 'content_type', 'image/jpeg')
-            AvatarBlob.objects.update_or_create(
-                user=user,
-                defaults={'content_type': content_type, 'data': data},
-            )
+            if settings.R2_ENABLED:
+                # Object storage: the avatar becomes a plain public CDN URL
+                # served directly by Cloudflare (see User.avatar_url), so the
+                # captcha-gated ``avatar`` view is no longer involved.
+                avatar.seek(0)
+                user.avatar.save(avatar.name, avatar, save=False)
+                AvatarBlob.objects.filter(user=user).delete()
+            else:
+                # Legacy path: keep the bytes in Postgres, served by the
+                # rate-limited ``avatar`` view.
+                avatar.seek(0)
+                data = avatar.read()
+                content_type = getattr(avatar, 'content_type', 'image/jpeg')
+                AvatarBlob.objects.update_or_create(
+                    user=user,
+                    defaults={'content_type': content_type, 'data': data},
+                )
 
         if commit:
             user.save()

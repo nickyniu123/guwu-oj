@@ -531,9 +531,9 @@ def password_reset_request(request):
                     user = User.objects.get(email__iexact=email, is_active=True)
                     code = issue_password_reset_code(email)
                     send_password_reset_code_email(email, code)
-                    logger.info('Password reset code sent for %s', email)
+                    logger.debug('Password reset code sent for %s', email)
                 except User.DoesNotExist:
-                    logger.info('Password reset requested for unknown email: %s', email)
+                    logger.debug('Password reset requested for unknown email: %s', email)
                 except Exception:
                     logger.exception('Failed to send password reset email to %s', email)
 
@@ -679,12 +679,15 @@ def verify_avatar_captcha_view(request):
 
 
 def avatar(request, username):
-    """Serve a user's avatar directly from the PostgreSQL database with caching."""
-    user = get_object_or_404(User, username=username)
-    if not user.has_avatar:
-        raise Http404('No avatar stored for this user')
+    """Serve a user's avatar directly from the PostgreSQL database with caching.
 
-    blob = user.avatar_blob
+    Only legacy avatars arrive here — avatars stored in object storage (R2)
+    are rendered as direct CDN URLs and never hit Django.
+    """
+    user = get_object_or_404(User, username=username)
+    blob = getattr(user, 'avatar_blob', None)
+    if blob is None:
+        raise Http404('No avatar stored for this user')
 
     # Count by requester IP, not avatar username, so rotating usernames cannot
     # bypass the protection. The current request is allowed to establish the

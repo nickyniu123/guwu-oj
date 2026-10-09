@@ -143,6 +143,7 @@ main.container {
 .difficulty-shengxuan  { background-color: #1abc9c; }
 .difficulty-noi        { background-color: #f39c12; }
 .status-Accepted { color: #2ecc71; font-weight: bold; }
+.status-Partial { color: #d4a017; font-weight: bold; }
 .status-Wrong { color: #e74c3c; font-weight: bold; }
 .status-Pending { color: #f39c12; font-weight: bold; }
 .status-Error { color: #c0392b; font-weight: bold; }
@@ -533,6 +534,24 @@ main.container {
     color: inherit;
     transition: background-color 180ms ease;
 }
+/* Animations */
+.animate-in {
+    opacity: 0;
+    transform: translateY(10px);
+}
+
+.animate-in.visible {
+    opacity: 1;
+    transform: translateY(0);
+    transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+                transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.animate-in.delay-1 { transition-delay: 0.05s; }
+.animate-in.delay-2 { transition-delay: 0.1s; }
+.animate-in.delay-3 { transition-delay: 0.15s; }
+.animate-in.delay-4 { transition-delay: 0.2s; }
+.animate-in.delay-5 { transition-delay: 0.25s; }
 
 .problem-rail a:hover {
     background: rgba(28, 61, 79, 0.04);

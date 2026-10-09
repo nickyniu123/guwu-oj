@@ -1,0 +1,183 @@
+/* Markdown + LaTeX toolbar for problem-statement textareas (theme-aware).
+   使用 --md-* 变量：亮色默认值定义在 :root，暗色覆盖集中在 oj-theme-v5f.css
+   （html[data-bs-theme="dark"]）。这样在不加载 Bootstrap 的 simpleui 管理后台
+   也能正常显示（亮色），公开页面则随 data-bs-theme 自适应。 */
+:root {
+    --md-toolbar-bg: #fff;
+    --md-toolbar-bar-bg: #f8f9fa;
+    --md-toolbar-border: #dee2e6;
+    --md-toolbar-color: #495057;
+    --md-toolbar-hover-bg: #e9ecef;
+    --md-toolbar-hover-border: #ced4da;
+    --md-toolbar-hover-color: #212529;
+    --md-toolbar-active-bg: #dee2e6;
+    --md-toolbar-group-border: #e9ecef;
+    --md-modal-border: #dee2e6;
+    --md-close-color: #6c757d;
+    --md-close-hover-color: #212529;
+    --md-dropzone-border: #adb5bd;
+    --md-dropzone-color: #6c757d;
+    --md-dropzone-active-border: #0d6efd;
+    --md-dropzone-active-bg: #f0f7ff;
+    --md-dropzone-active-color: #0d6efd;
+}
+
+.md-toolbar-wrapper {
+    border: 1px solid var(--md-toolbar-border);
+    border-radius: 0.375rem;
+    overflow: hidden;
+    background: var(--md-toolbar-bg);
+    color: var(--md-toolbar-color);
+}
+
+.md-toolbar-wrapper textarea {
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}
+
+.md-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 4px 6px;
+    background: var(--md-toolbar-bar-bg);
+    border-bottom: 1px solid var(--md-toolbar-border);
+}
+
+.md-toolbar-group {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 1px;
+    padding: 0 4px;
+    border-right: 1px solid var(--md-toolbar-group-border);
+}
+
+.md-toolbar-group:last-child {
+    border-right: none;
+}
+
+.md-toolbar-btn {
+    min-width: 28px;
+    height: 28px;
+    padding: 0 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    border-radius: 4px;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    color: var(--md-toolbar-color);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.md-toolbar-btn:hover {
+    background: var(--md-toolbar-hover-bg);
+    border-color: var(--md-toolbar-hover-border);
+    color: var(--md-toolbar-hover-color);
+}
+
+.md-toolbar-btn:active {
+    background: var(--md-toolbar-active-bg);
+}
+
+/* image upload modal */
+.md-toolbar-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1080;
+    display: none;
+    align-items: center;
+    justify-content: center;
+}
+
+.md-toolbar-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+}
+
+.md-toolbar-modal-dialog {
+    position: relative;
+    width: 90%;
+    max-width: 460px;
+    background: var(--md-toolbar-bg);
+    color: var(--md-toolbar-color);
+    border: 1px solid var(--md-modal-border);
+    border-radius: 0.5rem;
+    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.3);
+    overflow: hidden;
+}
+
+.md-toolbar-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--md-modal-border);
+}
+
+.md-toolbar-close {
+    background: none;
+    border: none;
+    font-size: 1.5rem;
+    line-height: 1;
+    color: var(--md-close-color);
+    cursor: pointer;
+    padding: 0 4px;
+}
+
+.md-toolbar-close:hover {
+    color: var(--md-close-hover-color);
+}
+
+.md-toolbar-modal-body {
+    padding: 1.25rem 1rem;
+}
+
+.md-toolbar-dropzone {
+    border: 2px dashed var(--md-dropzone-border);
+    border-radius: 0.5rem;
+    padding: 2rem 1rem;
+    text-align: center;
+    cursor: pointer;
+    color: var(--md-dropzone-color);
+    transition: all 0.15s;
+}
+
+.md-toolbar-dropzone:hover,
+.md-toolbar-dropzone.drag-over {
+    border-color: var(--md-dropzone-active-border);
+    background: var(--md-dropzone-active-bg);
+    color: var(--md-dropzone-active-color);
+}
+
+.md-toolbar-dropzone p {
+    margin: 0.4rem 0 0;
+}
+
+/* 暗色模式覆盖（与站点 data-bs-theme="dark" 一致）。
+   放在本文件内而非 oj-theme-v5f.css，是因为本文件为新路径、不会被
+   Cloudflare 旧缓存钉死，确保暗色主题即时生效。 */
+html[data-bs-theme="dark"] {
+    --md-toolbar-bg: #111a2c;
+    --md-toolbar-bar-bg: #16203a;
+    --md-toolbar-border: #2a3650;
+    --md-toolbar-color: #e2e8f0;
+    --md-toolbar-hover-bg: rgba(148, 163, 184, 0.12);
+    --md-toolbar-hover-border: #2a3650;
+    --md-toolbar-hover-color: #f1f5f9;
+    --md-toolbar-active-bg: rgba(148, 163, 184, 0.20);
+    --md-toolbar-group-border: #2a3650;
+    --md-modal-border: #2a3650;
+    --md-close-color: #94a3b8;
+    --md-close-hover-color: #f1f5f9;
+    --md-dropzone-border: #2a3650;
+    --md-dropzone-color: #94a3b8;
+    --md-dropzone-active-border: #60a5fa;
+    --md-dropzone-active-bg: rgba(96, 165, 250, 0.12);
+    --md-dropzone-active-color: #60a5fa;
+}

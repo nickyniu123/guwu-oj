@@ -13,7 +13,7 @@ django-redis
 django-mathfilters
 gunicorn
 whitenoise
-django-rq<5.0
+celery[redis]>=5.6,<6.0
 django-ratelimit
 prometheus-client
 django-prometheus
@@ -40,3 +40,11 @@ argon2-cffi>=23.0.0
 # AI 解题 + Stripe 订阅支付
 openai>=2.0.0
 stripe>=15.0.0
+
+# Cloudflare R2 对象存储（题目图片 + 用户头像）——S3 兼容接口
+django-storages[s3]>=1.14
+boto3>=1.34
+
+# WebSocket live judge-status push: served by Granian (--interface asgi),
+# same runtime as the main WSGI site. See oj_project/asgi.py and
+# deploy/systemd/guwu-oj-ws.service.

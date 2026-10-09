@@ -1,557 +1,181 @@
 # 洛谷风格 OJ - 在线评测系统
 
-一个模仿洛谷的在线评测系统，使用 Python、Django 和 Bootstrap 5 构建。
+模仿洛谷的在线评测系统，Django 5 + Bootstrap 5 构建，支持分布式判题、多优先级队列、DB-less 测评机与 WebSocket 实时评测状态。
 
 ## 功能特性
 
-- 用户系统
-  - 用户注册、登录、登出
-  - 个人资料管理（头像、昵称、简介）
-  - 用户主页展示提交记录和已解决的题目
+- **用户**：注册 / 登录、个人资料（头像、昵称、简介）、个人主页（提交记录、已解决题目）
+- **题库**：题目列表（难度 / 标签筛选）、题目详情、9 级难度（入门 → NOI）
+- **提交**：10 种语言在线评测、提交详情（代码、逐测试点结果、耗时 / 内存）、WebSocket 实时状态（失败自动降级 HTTP 轮询）
+- **分布式判题**：Celery + 中央 Redis 单队列多优先级、多机竞争消费、原子抢占 + 租约心跳 + 栅栏写回；测评机可完全无数据库凭证（DB-less）
+- **NAT 自愈**：测评机自报公网 IP，Web 侧自动同步 iptables 放行直连端口；直连不可达时回退 CDN
+- **其他**：排行榜、比赛、题解、AI 解题讲解、文档搜索、积分与签到、管理后台
 
-- 题库系统
-  - 题目列表（支持按难度、标签筛选）
-  - 题目详情页（包含题目描述、输入输出格式、样例等）
-  - 难度分级（入门、普及-、普及、普及+、提高-、提高、提高+、省选、NOI）
+## 技术栈
 
-- 提交系统
-  - 代码提交（支持 C、C++、Python、Java、JavaScript、Go、Rust、Ruby、Kotlin、Assembly）
-  - 提交记录查看
-  - 提交详情（代码、评测结果、运行时间、内存使用）
+Django 5 · PostgreSQL · Redis（缓存 + Celery broker + pub/sub）· Celery（线程池 worker）· Docker（语言沙箱 + 容器池）· Granian 双服务（WSGI 主站 + 独立 ASGI WebSocket，无 Channels）
 
-- 排行榜
-  - 用户排名（按已解决题目数排序）
-  - 统计信息（已解决数、提交数、通过率）
-
-- 管理后台
-  - 题目管理
-  - 用户管理
-  - 提交记录管理
-
-## 核心架构
-
-- Django 5+
-- Bootstrap
-- PostgreSQL
-- Docker (用于沙箱评测环境)
-- Redis+RQ (缓存 + 任务队列)
-
-## 安装步骤
-
-### 使用 Docker（推荐）
-
-项目使用按语言拆分的轻量 Docker 镜像进行沙箱评测，替代单一巨型镜像：
+## 快速开始（开发）
 
 ```bash
-# 构建所有评测镜像（一次性）
-./scripts/build-containers.sh
-```
-
-构建后将产生 5 个独立镜像：
-
-| 镜像 | 语言 | 大小 |
-|------|------|------|
-| `oj-python` | Python | ~44MB |
-| `oj-c` | C | ~98MB |
-| `oj-cpp` | C++ | ~116MB |
-| `oj-java` | Java | ~183MB |
-| `oj-other` | Go, Rust, JS, Ruby, Kotlin, ASM | ~640MB |
-
-判题时系统会根据提交语言自动选择对应镜像，无需手动指定。
-
-如果你更倾向于本地直接运行而非 Docker，可跳过此段，继续使用常规的 Python 环境。
-
-## 安装步骤
-
-### 1. 克隆项目
-
-```bash
-git clone https://github.com/alphadamn/guwu-oj
-cd guwu-oj
-```
-
-### 2. 创建虚拟环境
-
-```bash
-python -m venv venv
-source venv/bin/activate  # macOS/Linux
-# 或
-venv\Scripts\activate  # Windows
-```
-
-### 3. 安装依赖
-
-```bash
+git clone https://github.com/alphadamn/guwu-oj && cd guwu-oj
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
 
-### 4. 数据库迁移
-
-```bash
-python manage.py makemigrations
+cp .env.example .env            # 填入 SECRET_KEY / DB / Redis 等
 python manage.py migrate
-```
-
-### 5. 创建超级用户
-
-```bash
 python manage.py createsuperuser
-```
-
-### 6. 处理静态文件
-
-```bash
 python manage.py collectstatic
+
+# 构建判题沙箱镜像（一次性，见下表）
+./scripts/build-containers.sh
+
+# 三个常驻进程（三个终端）
+python manage.py runserver                                                          # 主站
+celery -A oj_project worker -Q judge -P threads -c 4 -l info                        # 判题 worker
+granian oj_project.asgi:application --interface asgi --host 127.0.0.1 --port 8447 --workers 1  # WS
 ```
 
-### 7. 启动开发服务器
+访问 http://127.0.0.1:8000 。环境自检：`python verify_setup.py`；测试：`python manage.py test`。
 
-```bash
-python manage.py runserver
+沙箱按语言拆为 5 个轻量镜像，判题时按提交语言自动选择：
+
+| 镜像 | 语言 | 约大小 |
+|------|------|--------|
+| `oj-python` | Python | 44MB |
+| `oj-c` | C | 98MB |
+| `oj-cpp` | C++ | 116MB |
+| `oj-java` | Java | 183MB |
+| `oj-other` | Go, Rust, JS, Ruby, Kotlin, ASM | 640MB |
+
+## 判题架构
+
+### 中央队列与优先级
+
+所有判题任务投递到中央 Redis 的**单一 Celery 逻辑队列 `judge`**，优先级用 Redis transport 的优先级桶实现，**数字越小越先消费**：
+
+| 优先级 | 用户层级 | priority | 物理桶 |
+|--------|----------|:--------:|--------|
+| pro | Pro 订阅 | 0 | `judge` |
+| plus | Plus 订阅 | 3 | `judge:3` |
+| free（默认） | 免费用户 | 6 | `judge:6` |
+| ai | AI 讲解的判题验证（专用服务账号，最低优先级） | 9 | `judge:9` |
+
+### 抢占 · 租约 · 栅栏（claim / lease / fence）
+
+`Submission` 上的状态机：`PENDING → QUEUED → JUDGING → DONE / FAILED`（迁移 0017/0018 新增字段，旧 `status` 判定字段不变）。核心逻辑在 [submissions/claiming.py](submissions/claiming.py)：
+
+- **抢占**：worker 开工用单条 `UPDATE ... WHERE judge_state IN ('PENDING','QUEUED') RETURNING claim_token`，竞争者中至多一个胜出；
+- **心跳**：判题期间每 15s 凭 token 续租（`heartbeat_at`）；
+- **栅栏写回**：结果写回必须同时匹配 `claim_token + JUDGING`，丢失租约的旧 worker 写入 0 行，积分 / solved M2M / 通知等副作用不会触发；
+- **回收**：reaper 常驻巡检，JUDGING 心跳超时 300s / QUEUED 距上次投递（`enqueued_at`）超 600s 的任务自动重投。requeue 的陈旧判定在原子 UPDATE 内完成，worker 在扫描与写入之间恢复心跳不会被误抢。
+- **基础设施重试**：有上限（默认 3 次 / 小时），指数退避；DB-less worker 的结果经 `judge:result` 可靠队列（处理中队列 + ACK + 死信 `judge:result:dead`）由 Web 侧消费者用同一套栅栏幂等写库。
+
+### DB-less 测评机（当前生产形态）
+
+测评机进程**不持有任何 PostgreSQL 凭证**：通过 HTTPS 内部 API（`/internal/judge/claim|heartbeat|cases/`，`X-Judge-Token` 常量时间比较，CSRF 豁免）抢占任务与拉取测试点，判完把结果信封 `LPUSH` 到中央 Redis；判题纯核心在 [submissions/judge_core.py](submissions/judge_core.py)（无 ORM）。多台机器跑**完全相同**的 worker 单元竞争消费，加机器只需把 `JUDGE_BROKER_URL` 指向同一个中央 Redis，无需任何 Django 侧配置。
+
 ```
-#### 或
-
-```bash
-gunicorn oj_project.wsgi --bind 0.0.0.0:8000
-```
-访问 http://127.0.0.1:8000 查看网站。
-#### 或使用systemd
-```
-[Unit]
-Description=Guwu Online Judge (Granian WSGI over Unix domain socket)
-After=network.target postgresql.service redis.service
-Wants=postgresql.service redis.service
-
-[Service]
-Type=simple
-User=root
-Group=root
-WorkingDirectory=/www/wwwroot/guwu-oj
-Environment="PATH=/www/wwwroot/guwu-oj/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="DJANGO_SETTINGS_MODULE=oj_project.settings"
-# The upstream hop (Caddy -> Granian) is plain HTTP/1.1, so request.is_secure()
-# must follow Caddy's X-Forwarded-Proto; without this, the production
-# SECURE_SSL_REDIRECT=true setting would redirect-loop every request.
-Environment="SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https"
-# With multiple workers, django_prometheus needs multiprocess mode for
-# correct /metrics aggregation.
-Environment="PROMETHEUS_MULTIPROC_DIR=/run/guwu-oj/prom"
-
-RuntimeDirectory=guwu-oj
-RuntimeDirectoryMode=0755
-ExecStartPre=/usr/bin/mkdir -p /run/guwu-oj/prom
-ExecStartPre=/usr/bin/rm -f /run/guwu-oj/guwu-oj.sock
-
-# Granian serves the Django WSGI app on a Unix domain socket (loopback-only,
-# no TLS/HTTP-3 needed for a local hop); nginx proxies to it over HTTP/1.1
-# keep-alive. Granian binds the socket root:root 660; nginx workers run as
-# www, so hand the socket's group to www after startup.
-#
-# Race fix: with Type=simple, ExecStartPost runs immediately after fork,
-# before granian has created the socket file. The wait loop polls for the
-# socket up to ~6s before chgrp, so the service no longer fails on a fast
-# system where granian takes 50-200ms to bind.
-ExecStartPost=/bin/bash -c 'for i in $(seq 1 60); do [ -S /run/guwu-oj/guwu-oj.sock ] && chgrp www /run/guwu-oj/guwu-oj.sock && exit 0; sleep 0.1; done; exit 1'
-ExecStart=/www/wwwroot/guwu-oj/venv/bin/granian \
-    --uds /run/guwu-oj/guwu-oj.sock \
-    --uds-permissions 660 \
-    --interface wsgi \
-    --http 1 \
-    --workers 12 \
-    --blocking-threads 2 \
-    --backpressure 30 \
-    --loop auto \
-    --access-log \
-    --log-level info \
-    --log-config /www/wwwroot/guwu-oj/deploy/granian_log_config.json \
-    --workers-lifetime 12h \
-    --workers-max-rss 500 \
-    --rss-samples 3 \
-    --respawn-failed-workers \
-    oj_project.wsgi:application
-
-# Clean shutdown: SIGTERM gives in-flight requests 30s.
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=30
-Restart=on-failure
-RestartSec=1
-
-# Auto-restart worker processes that crash or get OOM-killed.
-RestartPreventExitStatus=0
-
-# Memory safety: 12 workers x ~150 MB normal RSS (~1.8 GB total). A cgroup
-# ceiling turns any runaway allocation into a deterministic, automatic service
-# restart instead of a global OOM that kills other services on the box.
-# MemoryHigh throttles softly (per-worker --workers-max-rss 500 recycles
-# bloated workers first), MemoryMax cgroup-OOMs -> Restart=on-failure.
-MemoryHigh=2200M
-MemoryMax=3200M
-
-[Install]
-WantedBy=multi-user.target
-```
-```bash
-systemctl enable guwu-oj
-systemctl start guwu-oj
+worker ──HTTPS /internal/judge/*──▶ Django: 原子抢占 / 心跳 / 测试点
+                                   result consumer ──▶ PostgreSQL
+中央 Redis（TLS + 密码）: judge 优先级队列 + judge:result + pub/sub
+reaper（Web 侧 30s 巡检）: 回收超时租约并重投
 ```
 
-### 8. 启动 Redis 服务
+### Broker 连接配置
 
-```bash
-redis-server
-```
-
-### 9. 启动 RQ Worker (用于异步评测)
-
-#### Redis 密码与 TLS 配置
-
-判题队列 Redis 必须同时启用 TLS 和密码认证。不要将真实密码写入版本控制；在 Web 服务器和每台判题机的受限 `.env` 文件中设置相同的 `RQ_REDIS_PASSWORD`。密码至少 12 个字符，并包含字母、数字和特殊字符。
+判题 broker Redis 必须启用 TLS + 密码（≥12 位，含字母 / 数字 / 特殊字符），不入库：
 
 ```dotenv
-RQ_REDIS_HOST=judge-redis.example.internal
-RQ_REDIS_PORT=6379
-RQ_REDIS_DB=0
-RQ_REDIS_PASSWORD=<generated-secret>
+# 推荐：worker 与 web 均可直接用完整 URL
+JUDGE_BROKER_URL=rediss://:<secret>@<redis-host>:6379/0?ssl_ca_certs=/etc/redis/tls/ca.crt
+# Web 端省略 JUDGE_BROKER_URL 时由下列变量拼出（RQ_REDIS_* 为兼容旧名，与 RQ 框架无关）
+RQ_REDIS_HOST=127.0.0.1
+RQ_REDIS_PASSWORD=<secret>
 RQ_REDIS_TLS=true
-RQ_REDIS_CA_CERT=/etc/redis/tls/ca.crt
 ```
 
-Redis 服务端必须使用相同密码配置 `requirepass`，并保持 `port 0` 与 TLS 端口配置。每次修改密码时，先更新所有 Web/判题机 `.env` 文件，再重启 Redis，最后重启所有 RQ worker。Django-RQ 从 `RQ_QUEUES` 的 URL 和 `REDIS_CONNECTION_KWARGS` 自动读取密码与 TLS 参数；`rqworker` 命令不应额外传入 Redis URL。
+健康探测与 WebSocket 多机订阅使用 `JUDGE_MACHINES_JSON` 或后台 `JudgeMachine` 记录（**仅 Web 进程**用，不参与任务分发）；worker 配置模板见 [deploy/env.judge.example](deploy/env.judge.example)。
 
-可使用下列命令验证认证与 TLS，其中未提供密码的命令必须返回 `NOAUTH Authentication required`：
+### 直连回源与动态 IP 自愈
+
+NAT 后测评机公网 IP 频繁变化，静态白名单不可维护：
+
+1. worker 定期（默认 600s）及直连抢占失败后，经 CDN 调 `POST /internal/judge/report_ip/`；
+2. Web 只从连接本身取源 IP（`X-Forwarded-For → CF-Connecting-IP → X-Real-IP → REMOTE_ADDR`，不信任请求体），仅接受公网 IPv4，写入 `/etc/guwu/judge-direct-ips.json`；
+3. 每次上报同步重建、且 `guwu-oj-judge-firewall.service` 每 5 分钟兜底重建两条 iptables 链：`JUDGE_DIRECT`（8446）与 `OJ_JUDGE_BROKER`（6379,8446，含内网静态 IP，生产实际先生效的链），链尾均为 DROP。
+
+worker 端 `JUDGE_API_BASE` 指直连端口、`JUDGE_API_FALLBACK_BASE` 指 CDN 域名，主 base 不可达自动轮换。Web `.env` 关键项：
+
+```dotenv
+OJ_JUDGE_DIRECT_STATIC_IPS=64.90.3.112        # 静态公网 IP，逗号分隔
+OJ_JUDGE_BROKER_STATIC_IPS=192.168.196.147    # broker 链额外放行的内网 IP
+```
+
+> 完整运维 Runbook（证书、防火墙脚本、CDN、排障）见 [OPS.md](OPS.md)。
+
+### WebSocket 实时推送
+
+- 端点 `/ws/submissions/<id>/status/`：[submissions/ws.py](submissions/ws.py) 原生 ASGI consumer，session cookie 鉴权（仅本人 / staff），单 worker 固定；
+- 链路：判题写库 → `post_save` 信号 → Redis `PUBLISH oj:submission:<id>` → ASGI 订阅查库推快照（消息不带数据，不泄露隐藏测试点）；另有 5s DB watchdog 兜底、断线 2s 重连；
+- 前端优先 WS（25s 心跳），4401/4403/4404 或 3 次重连失败自动降级 800ms HTTP 轮询；
+- nginx 需反代 `/ws/` 到 `127.0.0.1:8447`（Upgrade 头、`proxy_buffering off`、读超时 3600s）；经 CDN 需在控制台开通 WebSocket。
+
+## 生产服务
+
+单元文件均在 [deploy/systemd/](deploy/systemd/)：
+
+| 组件 | 单元 | 部署位置 |
+|------|------|----------|
+| 主站（Granian WSGI，Unix socket） | `guwu-oj.service` | Web |
+| WebSocket ASGI（127.0.0.1:8447） | `guwu-oj-ws.service` | Web |
+| 判题 worker（Celery 线程池，竞争消费） | `guwu-oj-judge-worker.service` | 每台测评机 |
+| 僵尸任务回收重投（30s 巡检） | `guwu-oj-judge-reaper.service` | Web |
+| `judge:result` 消费者（栅栏幂等写库） | `guwu-oj-judge-result-consumer.service` | Web |
+| 直连端口 iptables 链同步（5min） | `guwu-oj-judge-firewall.service` | Web（root） |
+
+改后端代码后 WSGI 与 ASGI 都需重启。常用命令：
 
 ```bash
-REDISCLI_AUTH="$RQ_REDIS_PASSWORD" redis-cli --tls --cacert "$RQ_REDIS_CA_CERT" \
-  -h "$RQ_REDIS_HOST" -p "$RQ_REDIS_PORT" ping
+python manage.py judge_overview        # 优先级桶深度、在线 worker、状态分布、僵尸数、近 1h 延迟/错误率
+python manage.py check_judge_health    # 逐机 Redis + 中央 broker 心跳
+python manage.py reap_stale_judgments  # 手动回收一轮（--loop 常驻）
+python manage.py sync_judge_firewall   # 重建 iptables 链（--loop 常驻，需 root）
 ```
 
-**macOS 用户需要设置环境变量:**
-```bash
-OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES python manage.py rqworker default high low
-```
-
-**Linux 用户:**
-```bash
-python manage.py rqworker default high low
-```
-
-#### 多判题机部署 (Multi-Judge)
-
-For production TLS/password and mTLS deployment, follow [Add a TLS + Password Judge Machine](docs/judge-machine-tls.md). It is the authoritative guide for per-machine credential paths, Django admin configuration, worker setup, verification, and credential rotation.
-
-支持将评测任务分发到多个判题机并行处理，提升系统吞吐量。
-
-**1. 配置判题机**
-
-在 `settings.py` 中添加 `JUDGE_MACHINES`：
-
-```python
-JUDGE_MACHINES = [
-    {
-        'name': 'judge-1',
-        'host': 'localhost',
-        'port': 6379,
-        'db': 0,
-        'queue': 'judge-1',
-        'enabled': True,
-        'weight': 1,
-    },
-    {
-        'name': 'judge-2',
-        'host': '192.168.1.100',
-        'port': 6379,
-        'db': 0,
-        'queue': 'judge-2',
-        'enabled': True,
-        'weight': 1,
-    },
-]
-```
-
-**2. 启用多判题模式**
-
-```bash
-export OJ_MULTI_JUDGE_ENABLED=true
-```
-
-**3. 在各判题机上启动 RQ Worker**
-
-```bash
-# 判题机 1
-OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES python manage.py rqworker judge-1 --worker-class oj_project.customrq.AutoReconnectWorker
-
-# 判题机 2
-OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES python manage.py rqworker judge-2 --worker-class oj_project.customrq.AutoReconnectWorker
-```
-
-每个 worker 进程内部以线程池并行评测多个提交，单机并行度由 `OJ_JUDGE_CONCURRENCY` 控制（默认 4，即 m 台机器 × 4 = m×n 的并行评测能力）。
-
-**4. 检查判题机健康状态**
-
-```bash
-python manage.py check_judge_health
-```
-
-负载均衡策略：
-- **加权随机分配**：根据 `weight` 字段按比例分发任务
-- **健康检查**：每 30 秒检查一次 Redis 连接，自动跳过不健康的机器
-- **降级兜底**：所有机器不可用时自动回退到 `default` 队列
-- 关闭多判题模式（`OJ_MULTI_JUDGE_ENABLED=false`）即恢复单机模式
-
-### 10. 验证环境配置 (可选)
-
-运行环境验证脚本检查所有组件是否正常工作:
-
-```bash
-python verify_setup.py
-```
-
-此脚本会检查:
-- Python 版本兼容性
-- 数据库连接和配置
-- Redis 连接和缓存操作
-- 数据库表完整性
-- Docker 状态和安全配置
-- Python 依赖包
-- 文件权限
-- 环境变量配置
-
-或使用selenium测试网站基础功能：
-
-```bash
-python manage.py test
-```
-
-
-## 项目结构
-
-```
-guwu-oj/
-├── manage.py                 # Django 管理脚本
-├── requirements.txt          # 项目依赖
-├── README.md                # 项目说明
-├── oj_project/              # Django 项目配置
-│   ├── __init__.py
-│   ├── settings.py          # 项目设置
-│   ├── urls.py              # 主 URL 配置
-│   └── wsgi.py              # WSGI 配置
-├── users/                   # 用户应用
-│   ├── __init__.py
-│   ├── apps.py
-│   ├── models.py            # 用户模型
-│   ├── forms.py             # 用户表单
-│   ├── views.py             # 用户视图
-│   ├── urls.py              # 用户 URL
-│   └── admin.py             # 用户管理后台
-├── problems/                # 题目应用
-│   ├── __init__.py
-│   ├── apps.py
-│   ├── models.py            # 题目模型
-│   ├── views.py             # 题目视图
-│   ├── urls.py              # 题目 URL
-│   └── admin.py             # 题目管理后台
-├── submissions/             # 提交应用
-│   ├── __init__.py
-│   ├── apps.py
-│   ├── models.py            # 提交模型
-│   ├── views.py             # 提交视图
-│   ├── urls.py              # 提交 URL
-│   └── admin.py             # 提交管理后台
-├── templates/               # 模板文件
-│   ├── base.html            # 基础模板
-│   ├── home.html            # 首页
-│   ├── leaderboard.html     # 排行榜
-│   ├── users/               # 用户模板
-│   │   ├── login.html
-│   │   ├── register.html
-│   │   ├── profile.html
-│   │   └── edit_profile.html
-│   ├── problems/            # 题目模板
-│   │   ├── problem_list.html
-│   │   └── problem_detail.html
-│   └── submissions/         # 提交模板
-│       ├── submit.html
-│       ├── detail.html
-│       ├── list.html
-│       └── all_list.html
-└── static/                  # 静态文件目录
-```
-
-### Redis 缓存与后台任务
-
-项目已在 `settings.py` 中配置了 **django‑redis**，默认使用 `redis://127.0.0.1:6379/1`。在生产环境建议使用独立的 Redis 实例，并通过环境变量覆盖 `REDIS_URL` 或直接修改 `CACHES` 配置。
-
-```python
-CACHES = {
-    "default": {
-        "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/1"),
-        "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
-    }
-}
-```
-
-### WhiteNoise 静态文件服务
-
-`WhiteNoise` 已加入 `MIDDLEWARE`，无需额外配置即可在 Gunicorn/uwsgi 等 WSGI 服务器上直接提供压缩和缓存的静态文件。若需要自定义缓存时间，可在 `settings.py` 添加：
-
-```python
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
-WHITENOISE_MAX_AGE = 31536000  # 1 year
-```
-
-## 生产环境特性
-
-### 异步评测系统
-
-项目使用 Django-RQ 实现异步评测，避免评测阻塞 HTTP 请求：
-
-- 评测任务通过 Redis 队列异步执行
-- 支持多个优先级队列 (default, high, low)
-- 评测结果自动更新到数据库
-- 支持任务失败重试和错误日志记录
-
-### 缓存策略
-
-- **页面缓存**: 使用 Redis 缓存视图响应
-- **查询缓存**: 缓存数据库查询结果 (问题列表、排行榜等)
-- **Markdown 缓存**: 缓存 Markdown 渲染结果，避免重复渲染
-- **缓存失效**: 数据变更时自动清除相关缓存
-
-### 监控与日志
-
-- **结构化日志**: 记录到控制台、文件和错误日志
-- **健康检查**: `/health/` 端点检查数据库、Redis 和缓存状态
-- **Prometheus 指标**: `/metrics/` 端点提供监控指标
-- **日志轮转**: 自动轮转日志文件，保留最近 5 个备份
-
-### 安全特性
-
-- **速率限制**: 提交限制为 3 次/分钟
-- **输入验证**: 搜索端点验证输入长度和字符
-- **XSS 防护**: Markdown 渲染使用 bleach 清理 HTML
-- **CSRF 保护**: 所有 POST 请求受 CSRF 保护
-- **验证码**: 图形验证码（原始 + 点阵双风格）+ ALTCHA 隐藏工作量证明，登录失败/注册/重置密码/高频提交/头像访问时要求
-
-### 支持的编程语言
-
-| 语言 | 编译方式 | 运行时 |
-|------|---------|--------|
-| C | `gcc -O2` | 原生执行 |
-| C++ | `g++ -std=c++17 -O2` | 原生执行 |
-| Python | — | `python3` |
-| Java | `javac` | `java` |
-| JavaScript | — | `node` |
-| Go | `go build` | 原生执行 |
-| Rust | `rustc --edition=2021` | 原生执行 |
-| Ruby | — | `ruby` |
-| Kotlin | `kotlinc` | `java -jar` |
-| Assembly | `as` + `ld` | Linux 原生 |
-
-## 验证码系统
-
-项目在图形验证码之上叠加了一层**非交互式的隐藏工作量证明验证码（ALTCHA v2）**。凡是需要验证码的场景，图形验证码与 ALTCHA **始终同时出现、同时校验**，不允许单独出现。
-
-### 图形验证码
-
-两种渲染风格按 50/50 随机切换（`users/captcha.py`）：
-
-- **原始风格**：多字体（DejaVu / Liberation / FreeSans）+ 逐字符旋转、剪切、缩放 + 波纹扭曲、干扰线、噪声等抗 OCR 处理。
-- **点阵风格**：内置点阵字体 `users/fonts/ZenDots-Regular.ttf`（Google Fonts，SIL OFL 许可）渲染为圆点字符，复用同一套抗 OCR 管线。
-
-两者均采用一次性消费（防重放）、每 IP 限流与缓存 TTL 到期失效。
-
-### ALTCHA 隐藏验证码
-
-- 使用官方 [`altcha`](https://pypi.org/project/altcha/) v2 库实现工作量证明（PoW），参数集中在 `users/altcha.py`：
-
-  ```python
-  ALGORITHM = 'PBKDF2/SHA-512'   # 可选 'PBKDF2/SHA-256' / 'ARGON2ID' / 'SCRYPT'
-  KDF_COST = 30000               # PBKDF2 迭代次数
-  COUNTER_MIN = 10               # 确定性 counter 范围（决定求解工作量）
-  COUNTER_MAX = 50
-  DEFAULT_TTL_SECONDS = 600      # 挑战 10 分钟内有效，一次性防重放
-  ```
-
-- 客户端在 `static/js/altcha-worker.js` 的 Web Worker 中用 WebCrypto 原生 `crypto.subtle.deriveBits` 求解，不阻塞主线程（无需 WASM）。若切换为 `ARGON2ID`，则服务端需安装 `argon2-cffi`，并使用对应的 WASM 求解器。
-- 服务端验证为 O(1)：通过 HMAC `keySignature` 校验解出的密钥，无需重算 KDF；并带 nonce 一次性防重放。
-
-### 触发位置
-
-| 场景 | 图形验证码 | ALTCHA |
-|------|:---------:|:------:|
-| 登录失败后（默认 1 次失败即触发） | ✅ | ✅ |
-| 注册 | ✅ | ✅ |
-| 重置密码（请求 + 确认两步） | ✅ | ✅ |
-| 提交频率超阈值 | ✅ | ✅ |
-| 头像高频访问 | ✅ | ✅ |
-| 全站高风险模式（所有 POST） | ✅ | ✅ |
-
-## 生产部署建议
-
-### 管理后台
-
-访问 http://127.0.0.1:8000/admin 进入管理后台，使用超级用户账号登录。
-
-### 添加题目
-
-1. 登录管理后台
-2. 进入 "Problems" -> "Problems"
-3. 点击 "Add problem"
-4. 填写题目信息：
-   - 标题
-   - 题目描述
-   - 输入格式
-   - 输出格式
-   - 样例输入/输出
-   - 提示（可选）
-   - 难度
-   - 时间限制（毫秒）
-   - 内存限制（MB）
-   - 标签
-5. 保存
-
-### 用户功能
-
-- 注册账号后可以浏览题目
-- 登录后可以提交代码
-- 在个人主页查看提交记录和已解决的题目
-- 在排行榜查看排名
-
-## 注意事项
-
-1. 本项目使用 PostgreSQL 作为默认数据库。
-2. SECRET_KEY 需要在生产环境中更改。
-3. 建议在生产环境中配置 ALLOWED_HOSTS。
+## 支持的语言
+
+| 语言 | 编译 / 运行 | | 语言 | 编译 / 运行 |
+|------|------------|---|------|------------|
+| C | `gcc -O2` | | Go | `go build` |
+| C++ | `g++ -std=c++17 -O2` | | Rust | `rustc --edition=2021` |
+| Python | `python3` | | Ruby | `ruby` |
+| Java | `javac` / `java` | | Kotlin | `kotlinc` / `java -jar` |
+| JavaScript | `node` | | Assembly | `as` + `ld` |
+
+## 其他生产特性
+
+- **缓存**：django-redis（`CACHE_REDIS_*` 配置）；页面 / 查询 / Markdown 渲染缓存，写操作自动失效；WhiteNoise 提供静态文件。
+- **安全**：提交限流（3 次/分钟）、bleach 清理 Markdown HTML、全站 CSRF、输入长度校验；登录失败 / 注册 / 改密 / 高频提交 / 高风险模式强制「图形验证码 + ALTCHA PoW」双验证（参数见 `users/altcha.py`）；后台强制 staff 2FA + sudo 模式。
+- **监控**：`/health/`（DB / Redis / 判题机）、`/metrics/`（Prometheus）、结构化 JSON 日志与轮转。
 
 ## 开发计划
 
-- [x] 实现自动化代码评测系统
-- [x] 添加更多编程语言支持 (JavaScript/Go/Rust/Ruby/Kotlin...)
-- [x] 判题 Docker 镜像按语言拆分
-- [x] 多判题机分布式部署 (Multi-Judge)
-- [x] 添加比赛功能
-- [ ] 植入AI解题功能
-- [x] 文档搜索引擎
-- [x] 添加题解功能
-- [ ] 优化移动端体验
-- [ ] 优化Windows支持（Worker Class重构……）
+- [x] 自动评测、10 种语言、按语言拆分沙箱镜像、容器池
+- [x] 中央 Celery 队列 + 抢占 / 租约 / 栅栏 + 僵尸回收 + DB-less 测评机
+- [x] 多判题机分布式、比赛、AI 解题、题解、文档搜索、移动端适配
+- [ ] Windows 支持改进（Worker Class 重构）
 
 ## 许可证
 
-MIT License
-
-## 联系方式
-
-如有问题或建议，欢迎提 Issue。
+MIT License。问题与建议欢迎提 Issue。
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=alphadamn%2Fguwu-oj&type=date&legend=top-left">
+<a href="https://www.star-history.com/#repos=alphadamn/guwu-oj&type=date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=alphadamn/guwu-oj&type=date&theme=dark&legend=top-left&sealed_token=yqA0UZU3rN-0gv3AQcGczh_JbALQAu_GVP0W649r7Fmb5fyVOzScWkdSCbrBAZl0Mr4MeCD4knhWPpDI8rZ2uyX2bhr45-LsZV66D8Nws7YrxMjbk51Srg" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=alphadamn/guwu-oj&type=date&legend=top-left&sealed_token=yqA0UZU3rN-0gv3AQcGczh_JbALQAu_GVP0W649r7Fmb5fyVOzScWkdSCbrBAZl0Mr4MeCD4knhWPpDI8rZ2uyX2bhr45-LsZV66D8Nws7YrxMjbk51Srg" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=alphadamn/guwu-oj&type=date&legend=top-left&sealed_token=yqA0UZU3rN-0gv3AQcGczh_JbALQAu_GVP0W649r7Fmb5fyVOzScWkdSCbrBAZl0Mr4MeCD4knhWPpDI8rZ2uyX2bhr45-LsZV66D8Nws7YrxMjbk51Srg" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=alphadamn/guwu-oj&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=alphadamn/guwu-oj&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=alphadamn/guwu-oj&type=date&legend=top-left" />
  </picture>
 </a>

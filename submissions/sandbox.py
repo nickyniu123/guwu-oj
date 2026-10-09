@@ -5,11 +5,16 @@ Performance / stability changes vs the previous naive approach:
 * A single long-running judge container is kept alive per submission and
   reused across test cases via `docker exec`. This amortises Docker startup
   overhead (≈0.5–1.5 s) across all test cases.
+* On judge workers the per-submission container itself comes from a warm
+  per-image container pool (see `submissions.container_pool`); this module
+  only owns the hardened `docker run` argv and the raw `docker exec` call,
+  shared by both the pool path and the one-container-per-submission
+  fallback.
 * `docker info` is cached in-process (with a short TTL) instead of being
   invoked on every test case.
 * The subprocess timeout honours the caller-supplied value. A small fixed
-  safety margin (1 s) is added so the in-container `/usr/bin/time` report
-  (the authoritative verdict) has time to be written.
+  safety margin (1 s) is added so the in-container timer report (ojrun, or
+  `/usr/bin/time` on hosts without it) has time to be written.
 * `stdin` bytes are never re-encoded; text mode is used only for stdin=None.
 * Container cleanup runs once on `__exit__`; periodic housekeeping is
   handled by `submissions.docker_cleanup.cleanup_stale_judge_containers`.
@@ -17,15 +22,20 @@ Performance / stability changes vs the previous naive approach:
 
 import os
 import grp
+import logging
 import pwd
 import shutil
+import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from django.conf import settings
 
 from .docker_cleanup import cleanup_stale_judge_containers
+
+logger = logging.getLogger(__name__)
 
 
 class DockerNotAvailableError(Exception):
@@ -102,7 +112,142 @@ def ensure_judge_image_available(image):
 
 def _memory_flags(memory_mb):
     mem = max(int(memory_mb), 32)
-    return ["--memory", f"{mem}m", "--memory-swap", f"{mem}m"]
+    flags = ["--memory", f"{mem}m", "--memory-swap", f"{mem}m"]
+    # Extra soft reclaim limit (cgroup memory.low / memory.high), kept
+    # alongside the hard cap above.  The kernel uses it to decide which
+    # containers to reclaim from first; a submission approaching its hard
+    # limit gets throttled before the OOM kill, smoothing degradation.
+    fraction = getattr(settings, "OJ_DOCKER_MEMORY_RESERVATION_FRACTION", 0.0)
+    if fraction > 0:
+        reservation = min(max(32, int(mem * fraction)), mem)
+        flags += ["--memory-reservation", f"{reservation}m"]
+    return flags
+
+
+# ── block-device auto-detection (cached) ─────────────────────────────────
+
+_root_device_cache = {"device": None, "ts": 0.0}
+_ROOT_DEVICE_TTL_SEC = 300
+
+
+# The kernel's cgroup-v2 io controller only accepts *whole* block devices
+# (io.max keys on the disk's major:minor).  Handing runc a partition such as
+# /dev/sda1 makes it write `rbps`/`wbps` to io.max and fail with ENODEV
+# ("No such device"), which aborts `docker run`.  Pseudo/stacked devices
+# (dm-*, md*, loop*, ...) are likewise not accepted, so we skip the BPS caps
+# for those rather than risk breaking container creation.
+_PSEUDO_BLOCK_PREFIXES = ("dm-", "md", "loop", "ram", "sr", "zram", "fd", "nbd")
+
+
+def _whole_block_device(src):
+    """Resolve ``src`` (e.g. ``/dev/sda1``) to its whole-disk node.
+
+    Returns the ``/dev/<disk>`` path accepted by ``--device-*-bps``, or
+    ``None`` when the backing device is pseudo/stacked or cannot be
+    resolved.
+    """
+    try:
+        st = os.stat(src)
+    except OSError:
+        return None
+    if not stat.S_ISBLK(st.st_mode):
+        return None
+    sysdir = f"/sys/dev/block/{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+    try:
+        real = os.path.realpath(sysdir)
+    except OSError:
+        return None
+    # A partition exposes a "partition" attribute; climb to the whole disk.
+    if os.path.exists(os.path.join(real, "partition")):
+        real = os.path.dirname(real)
+    name = os.path.basename(real)
+    if not name or name.startswith(_PSEUDO_BLOCK_PREFIXES):
+        return None
+    candidate = os.path.join("/dev", name)
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+
+def _detect_root_block_device():
+    """Return the whole block device backing ``/``, or ``None`` if unknown.
+
+    Used to attach ``--device-*-bps`` I/O caps.  Cached for 5 minutes so
+    the per-container ``docker run`` never pays a ``df`` call.
+    """
+    entry = _root_device_cache
+    now = time.monotonic()
+    cached = entry["device"]
+    if cached is not None and (now - entry["ts"]) < _ROOT_DEVICE_TTL_SEC:
+        return cached if cached != "" else None
+    device = None
+    try:
+        result = subprocess.run(
+            ["df", "--output=source", "/"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            lines = result.stdout.strip().splitlines()
+            if len(lines) > 1:
+                src = lines[-1].strip()
+                if src.startswith("/dev/"):
+                    device = _whole_block_device(src)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    # Cache even the "not found" sentinel so we don't retry every call.
+    entry["device"] = device or ""
+    entry["ts"] = now
+    return device
+
+
+def _io_flags():
+    """Disk I/O cgroup flags: blkio weight + per-device BPS/IOPS caps."""
+    flags = []
+    weight = getattr(settings, "OJ_DOCKER_BLKIO_WEIGHT", 0)
+    if weight > 0:
+        flags += ["--blkio-weight", str(weight)]
+    read_bps = getattr(settings, "OJ_DOCKER_IO_READ_BPS", "")
+    write_bps = getattr(settings, "OJ_DOCKER_IO_WRITE_BPS", "")
+    read_iops = getattr(settings, "OJ_DOCKER_IO_READ_IOPS", 0)
+    write_iops = getattr(settings, "OJ_DOCKER_IO_WRITE_IOPS", 0)
+    if read_bps or write_bps or read_iops or write_iops:
+        try:
+            dev = _detect_root_block_device()
+        except Exception:  # never let an optional cap break judging
+            logger.warning("Block-device detection failed; skipping BPS caps",
+                           exc_info=True)
+            dev = None
+        if dev:
+            if read_bps:
+                flags += ["--device-read-bps", f"{dev}:{read_bps}"]
+            if write_bps:
+                flags += ["--device-write-bps", f"{dev}:{write_bps}"]
+            if read_iops:
+                flags += ["--device-read-iops", f"{dev}:{read_iops}"]
+            if write_iops:
+                flags += ["--device-write-iops", f"{dev}:{write_iops}"]
+    return flags
+
+
+def _cpu_flags():
+    """CPU cgroup flags: core quota + relative shares."""
+    flags = []
+    cpu_limit = getattr(settings, "OJ_DOCKER_CPU_LIMIT", "")
+    if cpu_limit and cpu_limit != "0":
+        flags += ["--cpus", cpu_limit]
+    shares = getattr(settings, "OJ_DOCKER_CPU_SHARES", 0)
+    if shares > 0:
+        flags += ["--cpu-shares", str(shares)]
+    return flags
+
+
+def _tmpfs_flag():
+    """tmpfs /tmp mount string with an optional size cap."""
+    size = getattr(settings, "OJ_DOCKER_TMPFS_SIZE", "").strip()
+    spec = "exec,mode=777"
+    if size:
+        spec = f"exec,mode=777,size={size}"
+    return ["--tmpfs", f"/tmp:{spec}"]
 
 
 def _runtime_user_flags():
@@ -111,10 +256,16 @@ def _runtime_user_flags():
     return ["--user", f"{uid}:{gid}"]
 
 
-def _seccomp_flag(is_compile):
+def _seccomp_profile_path():
+    """Container-creation seccomp profile (the compile-phase superset).
+
+    Every judge container hosts a compile step, so containers always start
+    with the compile profile; the execute phase is narrowed *inside* the
+    container by the ojsec launcher (see docker/judge/ojsec.c), which stacks
+    seccomp-execute.json on top before exec'ing submitted code.
+    """
     base_dir = Path(__file__).resolve().parent.parent
-    profile = "seccomp-compile.json" if is_compile else "seccomp-execute.json"
-    return str(base_dir / "docker" / "judge" / profile)
+    return str(base_dir / "docker" / "judge" / "seccomp-compile.json")
 
 
 def _apparmor_flag():
@@ -122,6 +273,50 @@ def _apparmor_flag():
     if not profile:
         raise DockerNotAvailableError("OJ_DOCKER_APPARMOR_PROFILE must not be empty")
     return profile
+
+
+# Container path the host ccache directory is bind-mounted at.
+CCACHE_MOUNT_PATH = "/ccache"
+
+# Only images that actually ship ccache get the shared cache mounted. Handing
+# an interpreter sandbox a writable path into the compilation cache would let
+# untrusted code poison the objects a later C/C++ submission compiles against.
+CCACHE_IMAGES = frozenset(("oj-c:latest", "oj-cpp:latest"))
+
+_ccache_warned = False
+
+
+def ccache_dir():
+    """Host ccache directory, or ``None`` when ccache is off or unusable.
+
+    The directory is created on first use and owned by the sandbox runtime
+    user, because the unprivileged compiler inside the container writes to it.
+    A host where that cannot be arranged just loses the cache: judging must
+    never fail over an optional optimisation.
+    """
+    global _ccache_warned
+    configured = str(getattr(settings, "OJ_CCACHE_DIR", "") or "").strip()
+    if not configured:
+        return None
+    path = Path(configured)
+    uid = int(getattr(settings, "OJ_DOCKER_UID", 65534))
+    gid = int(getattr(settings, "OJ_DOCKER_GID", 65534))
+    try:
+        if not path.is_dir():
+            path.mkdir(parents=True, exist_ok=True)
+            os.chmod(path, 0o700)
+        stat = path.stat()
+        if (stat.st_uid, stat.st_gid) != (uid, gid):
+            os.chown(path, uid, gid)
+    except OSError as exc:
+        if not _ccache_warned:
+            _ccache_warned = True
+            logger.warning(
+                "ccache disabled: %s is not writable by uid %s (%s)",
+                configured, uid, exc,
+            )
+        return None
+    return str(path)
 
 def chown_rec(path, user, group):
     uid = pwd.getpwnam(user).pw_uid
@@ -144,6 +339,29 @@ def exit_indicates_memory_limit(returncode):
     return returncode in (137, -9)
 
 
+# Path ojrun is mounted at inside judge containers (see below).
+OJRUN_CONTAINER_PATH = "/opt/oj/ojrun"
+# Path of the execute-phase seccomp launcher (same read-only bind mount).
+OJSEC_CONTAINER_PATH = "/opt/oj/ojsec"
+
+
+def ojrun_host_dir():
+    """Host dir holding the static ojrun timer binary, or None.
+
+    ojrun (docker/judge/ojrun.c) replaces GNU time for per-case timing:
+    microsecond wall-clock resolution instead of 10 ms. It is bind-mounted
+    read-only into every judge container so images need no rebuild; a judge
+    host without the binary simply falls back to /usr/bin/time.
+    """
+    path = Path(__file__).resolve().parent.parent / "docker" / "judge" / "ojbin"
+    try:
+        if (path / "ojrun").is_file():
+            return str(path)
+    except OSError:
+        pass
+    return None
+
+
 def _kill_container(cid):
     if not cid:
         return
@@ -154,6 +372,313 @@ def _kill_container(cid):
 
 
 # ── Long-running JudgeContainer ─────────────────────────────────────────
+
+POOL_ROLE_LABEL = "oj.judge.role"
+POOL_IMAGE_LABEL = "oj.judge.image"
+POOL_WORKER_LABEL = "oj.judge.worker"
+
+
+def build_judge_run_args(
+    work_dir, memory_mb, image, is_compile=False, labels=None, use_init=False
+):
+    """Construct the ``docker run`` argv for a judge sandbox container.
+
+    The same hardened defaults (no network, no IPC, dropped caps, read-only
+    rootfs, seccomp/apparmor profiles, device allow-list) are shared by the
+    one-shot :class:`JudgeContainer` fallback path and by the warm container
+    pool (``submissions.container_pool``).
+
+    *labels* — optional mapping of ``--label`` key/values (used by the pool
+    so housekeeping can tell pooled containers apart from orphans).
+    *use_init* — when true, ``--init`` reaps zombies left by submissions
+    (pooled containers serve many submissions and therefore need it).
+    """
+    args = [
+        "docker", "run", "--rm", "-d", "-i",
+        "--network", "none",
+        "--ipc", "none",
+        "--hostname", "judge",
+        *_memory_flags(memory_mb),
+        *_runtime_user_flags(),
+        "--pids-limit", str(getattr(settings, "OJ_DOCKER_PIDS_LIMIT", 64)),
+        "--ulimit", "nofile={0}:{0}".format(
+            max(16, int(getattr(settings, "OJ_DOCKER_NOFILE_LIMIT", 64)))
+        ),
+        *_io_flags(),
+        *_cpu_flags(),
+        "--security-opt", "no-new-privileges=true",
+        "--security-opt", f"seccomp={_seccomp_profile_path()}",
+        "--cap-drop", "ALL",
+        "--read-only",
+        "--security-opt", f"apparmor={_apparmor_flag()}",
+        *_tmpfs_flag(),
+        "--device", "/dev/null:rw",
+        "--device", "/dev/zero:r",
+        "--device", "/dev/random:r",
+        "--device", "/dev/urandom:r",
+        "-v", f"{work_dir}:/sandbox:rw",
+        "-w", "/sandbox",
+    ]
+    ojbin = ojrun_host_dir()
+    if ojbin:
+        args.extend(["-v", f"{ojbin}:/opt/oj:ro"])
+    cache = ccache_dir() if image in CCACHE_IMAGES else None
+    if cache:
+        args.extend([
+            "-v", f"{cache}:{CCACHE_MOUNT_PATH}:rw",
+            "--env", f"CCACHE_DIR={CCACHE_MOUNT_PATH}",
+            # Each submission compiles from its own /sandbox/<token> directory.
+            # Both settings keep that per-submission path out of the cache key,
+            # without which no two submissions could ever share an entry.
+            "--env", "CCACHE_BASEDIR=/sandbox",
+            "--env", "CCACHE_NOHASHDIR=1",
+            "--env", f"CCACHE_MAXSIZE={getattr(settings, 'OJ_CCACHE_MAX_SIZE', '5G')}",
+        ])
+    if use_init:
+        args.append("--init")
+    for key, value in (labels or {}).items():
+        args.extend(["--label", f"{key}={value}"])
+    args.extend([image, "sleep", "infinity"])
+    return args
+
+
+def start_judge_container(
+    work_dir, memory_mb, image, is_compile=False, labels=None, use_init=False
+):
+    """Start a detached long-lived judge container; return its cid.
+
+    ``docker run`` failures (daemon unreachable, image missing, security
+    profile not loaded, ...) are normalised to
+    :class:`DockerNotAvailableError`.
+    """
+    args = build_judge_run_args(
+        work_dir,
+        memory_mb,
+        image,
+        is_compile=is_compile,
+        labels=labels,
+        use_init=use_init,
+    )
+    try:
+        create = subprocess.run(
+            args, capture_output=True, text=True, timeout=30
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise DockerNotAvailableError(
+            f"Failed to start judge container: {exc}"
+        )
+    if create.returncode != 0:
+        raise DockerNotAvailableError(
+            f"Failed to start judge container: {create.stderr or create.stdout}"
+        )
+    return create.stdout.strip().strip('"').strip("'")
+
+
+def update_judge_container_memory(cid, memory_mb):
+    """Resize a running judge container's cgroup memory + swap caps.
+
+    The warm pool serves problems with different memory limits; the cgroup
+    cap is what turns a memory-hogging submission into SIGKILL (rc 137 →
+    MLE), so each checkout is resized to ``max(problem limit, 512)`` —
+    exactly what the one-container-per-submission path used. Takes a few
+    tens of milliseconds, vs ≈0.5–1.5 s for a fresh ``docker run``.
+
+    The soft reservation (``--memory-reservation``) is also recalculated
+    so it tracks the new hard cap at the configured fraction.
+    """
+    mem = max(int(memory_mb), 32)
+    update_args = ["docker", "update",
+                    "--memory", f"{mem}m",
+                    "--memory-swap", f"{mem}m"]
+    fraction = getattr(settings, "OJ_DOCKER_MEMORY_RESERVATION_FRACTION", 0.0)
+    if fraction > 0:
+        reservation = min(max(32, int(mem * fraction)), mem)
+        update_args += ["--memory-reservation", f"{reservation}m"]
+    update_args.append(cid)
+    try:
+        result = subprocess.run(
+            update_args,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise DockerNotAvailableError(
+            f"Failed to resize judge container memory: {exc}"
+        )
+    if result.returncode != 0:
+        raise DockerNotAvailableError(
+            f"Failed to resize judge container memory: "
+            f"{result.stderr or result.stdout}"
+        )
+
+
+def run_capture_bounded(cmd, stdin, timeout_sec, limit_bytes, text=True):
+    """Run *cmd* with per-stream byte caps on stdout and stderr.
+
+    Pipes are always opened in binary and drained by reader threads: the
+    first *limit_bytes* bytes of each stream are retained, anything
+    beyond that keeps being read (so the child never blocks on a full
+    pipe / deadlocks) but is discarded. As soon as one stream exceeds
+    the cap the client process is SIGKILLed — the in-container writer
+    then receives SIGPIPE (or is reaped by the in-container deadline),
+    bounding worker CPU/IO as well as RAM.
+
+    Returns a :class:`subprocess.CompletedProcess` with an extra
+    ``output_truncated`` attribute. When *text* is true the retained
+    bytes are UTF-8 decoded (``errors='replace'``), otherwise bytes are
+    returned, matching ``subprocess.run(text=...)`` semantics.
+
+    Raises :class:`subprocess.TimeoutExpired` on *timeout_sec*, same as
+    ``subprocess.run``.
+    """
+    data = stdin
+    if text and data is not None and isinstance(data, str):
+        data = data.encode("utf-8", "replace")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    out_holder = {"data": b"", "truncated": False}
+    err_holder = {"data": b"", "truncated": False}
+
+    def feed_stdin():
+        try:
+            if data is not None:
+                proc.stdin.write(data)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def drain(stream, holder):
+        # Read cap+1 bytes so the overflow is observable, then keep
+        # draining to discard the rest without blocking the producer.
+        kept = bytearray()
+        while True:
+            try:
+                chunk = stream.read(65536)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            room = (limit_bytes + 1) - len(kept)
+            if room > 0:
+                kept.extend(chunk[:room])
+            if len(kept) > limit_bytes:
+                # Publish immediately so the main loop kills the
+                # producer without waiting for the whole stream.
+                holder["truncated"] = True
+        try:
+            stream.close()
+        except OSError:
+            pass
+        holder["data"] = bytes(kept)
+        holder["done"] = True
+
+    t_in = threading.Thread(target=feed_stdin, daemon=True)
+    t_out = threading.Thread(
+        target=drain, args=(proc.stdout, out_holder), daemon=True)
+    t_err = threading.Thread(
+        target=drain, args=(proc.stderr, err_holder), daemon=True)
+    t_in.start()
+    t_out.start()
+    t_err.start()
+
+    deadline = time.monotonic() + max(float(timeout_sec), 0.1)
+    killed_for_overflow = False
+    try:
+        while True:
+            try:
+                proc.wait(0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if out_holder.get("truncated") or err_holder.get("truncated"):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
+                    killed_for_overflow = True
+                    break
+                if time.monotonic() >= deadline:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
+                    raise
+    finally:
+        t_in.join(1.0)
+        t_out.join(2.0)
+        t_err.join(2.0)
+
+    stdout_bytes = out_holder.get("data", b"")
+    stderr_bytes = err_holder.get("data", b"")
+    truncated = (
+        killed_for_overflow
+        or out_holder.get("truncated", False)
+        or err_holder.get("truncated", False)
+    )
+
+    if text:
+        stdout = stdout_bytes[:limit_bytes].decode("utf-8", "replace")
+        stderr = stderr_bytes[:limit_bytes].decode("utf-8", "replace")
+    else:
+        stdout = stdout_bytes[:limit_bytes]
+        stderr = stderr_bytes[:limit_bytes]
+
+    result = subprocess.CompletedProcess(
+        cmd, proc.returncode, stdout, stderr
+    )
+    result.output_truncated = bool(truncated)
+    return result
+
+
+def docker_exec(cid, command, timeout_sec, stdin=None, workdir=None):
+    """Run *command* via ``docker exec`` inside running container *cid*.
+
+    *workdir* overrides the container's default working directory
+    (``/sandbox``). The warm pool bind-mounts one shared host root at
+    ``/sandbox`` and executes each submission in its own subdirectory.
+
+    Returns a :class:`subprocess.CompletedProcess` like object.
+    ``stdout`` / ``stderr`` are decoded strings when *stdin* is not bytes,
+    otherwise they are bytes (matching subprocess semantics). The result
+    carries an ``output_truncated`` flag, set when stdout/stderr exceeded
+    ``settings.OJ_OUTPUT_LIMIT_BYTES``.
+    """
+    if not cid:
+        raise DockerNotAvailableError("Judge container is not running")
+
+    input_is_bytes = isinstance(stdin, (bytes, bytearray, memoryview))
+    text_mode = stdin is None or not input_is_bytes
+    full_cmd = ["docker", "exec", "-i"]
+    if workdir:
+        full_cmd.extend(["-w", workdir])
+    full_cmd.extend([cid, *command])
+
+    limit = int(getattr(settings, "OJ_OUTPUT_LIMIT_BYTES", 0) or 0)
+    if limit <= 0:
+        # Cap disabled: keep a very large ceiling so the bounded path is
+        # still used uniformly.
+        limit = 1 << 40
+
+    return run_capture_bounded(
+        full_cmd,
+        stdin,
+        max(float(timeout_sec), 0.1),
+        limit,
+        text=text_mode,
+    )
+
 
 class JudgeContainer:
     """Keeps a single judge container alive for many ``docker exec`` calls.
@@ -177,45 +702,12 @@ class JudgeContainer:
         ensure_docker_ready()
         ensure_judge_image_available(self.image)
         _prepare_work_dir(self.work_dir)
-        args = [
-            "docker", "run", "--rm", "-d", "-i",
-            "--network", "none",
-            "--ipc", "none",
-            "--hostname", "judge",
-            *_memory_flags(self.memory_mb),
-            *_runtime_user_flags(),
-            "--pids-limit", str(getattr(settings, "OJ_DOCKER_PIDS_LIMIT", 64)),
-            "--ulimit", "nofile={0}:{0}".format(
-                max(16, int(getattr(settings, "OJ_DOCKER_NOFILE_LIMIT", 64)))
-            ),
-            "--security-opt", "no-new-privileges=true",
-            "--security-opt", f"seccomp={_seccomp_flag(self.is_compile)}",
-            "--cap-drop", "ALL",
-            "--read-only",
-            "--security-opt", f"apparmor={_apparmor_flag()}",
-            "--tmpfs", "/tmp:exec,mode=777",
-            "--device", "/dev/null:rw",
-            "--device", "/dev/zero:r",
-            "--device", "/dev/random:r",
-            "--device", "/dev/urandom:r",
-            "-v", f"{self.work_dir}:/sandbox:rw",
-            "-w", "/sandbox",
+        self.cid = start_judge_container(
+            self.work_dir,
+            self.memory_mb,
             self.image,
-            "sleep", "infinity",
-        ]
-        try:
-            create = subprocess.run(
-                args, capture_output=True, text=True, timeout=30
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            raise DockerNotAvailableError(
-                f"Failed to start judge container: {exc}"
-            )
-        if create.returncode != 0:
-            raise DockerNotAvailableError(
-                f"Failed to start judge container: {create.stderr or create.stdout}"
-            )
-        self.cid = create.stdout.strip().strip('"').strip("'")
+            is_compile=self.is_compile,
+        )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -224,25 +716,15 @@ class JudgeContainer:
         finally:
             self.cid = None
 
-    def exec(self, command, timeout_sec, stdin=None):
+    def exec(self, command, timeout_sec, stdin=None, workdir=None):
         """Run *command* inside the running container.
 
         Returns a :class:`subprocess.CompletedProcess` like object.
         ``stdout`` / ``stderr`` are decoded strings when *stdin* is not bytes,
         otherwise they are bytes (matching subprocess semantics).
         """
-        if not self.cid:
-            raise DockerNotAvailableError("Judge container is not running")
-
-        input_is_bytes = isinstance(stdin, (bytes, bytearray, memoryview))
-        text_mode = stdin is None or not input_is_bytes
-        full_cmd = ["docker", "exec", "-i", self.cid, *command]
-        return subprocess.run(
-            full_cmd,
-            input=stdin,
-            capture_output=True,
-            text=text_mode,
-            timeout=max(float(timeout_sec), 0.1),
+        return docker_exec(
+            self.cid, command, timeout_sec, stdin=stdin, workdir=workdir
         )
 
 

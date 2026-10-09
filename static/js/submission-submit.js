@@ -39,6 +39,22 @@ document.addEventListener('DOMContentLoaded', function () {
     var idEl = document.getElementById('captcha-id');
     var answerEl = document.getElementById('captcha-answer');
     var captchaUrl = form ? form.getAttribute('data-captcha-url') : '';
+    // Allow only a same-origin absolute path (starts with a single '/').
+    // Explicit charAt/indexOf guards (a regex test was not modeled as a
+    // sanitizer) reject protocol-relative ("//host"), backslash smuggling
+    // ("\/host"), any scheme ("javascript:...") and CR/LF header/script
+    // injection before the value can reach fetch() or img.src below.
+    if (captchaUrl) {
+        if (captchaUrl.charAt(0) !== '/'
+            || captchaUrl.charAt(1) === '/'
+            || captchaUrl.charAt(1) === '\\'
+            || captchaUrl.indexOf(':') !== -1
+            || captchaUrl.indexOf('\\') !== -1
+            || captchaUrl.indexOf('\n') !== -1
+            || captchaUrl.indexOf('\r') !== -1) {
+            captchaUrl = '';
+        }
+    }
     if (img && idEl && captchaUrl) {
         function refreshCaptcha() {
             img.classList.add('refreshing');

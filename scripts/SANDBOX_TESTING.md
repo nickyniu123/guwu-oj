@@ -88,8 +88,18 @@ while True:
 
 After each test, **Django must keep running** and other users can still submit — the bad code must not take down the host process.
 
-## 5. Limits (honest scope)
+## 5. Defense layers and scope
 
-- This is **Docker isolation**, not a full seccomp/AppArmor production judge.
-- Submissions can still **burn CPU/time** until timeout; **read/write only under `/sandbox`** on the mounted volume.
-- **Do not** treat as complete security audit; for production, add separate judge workers, quotas, and seccomp profiles.
+- Containers run default-deny seccomp (`seccomp-compile.json`) **stacked with
+  the tighter execute whitelist** installed by the `ojsec` launcher for every
+  untrusted-code invocation (`seccomp-execute.json`), plus the `oj-judge`
+  AppArmor profile, `--network none`, dropped caps, read-only rootfs and
+  cgroup/PID limits.
+- After changing `seccomp-execute.json`, regenerate and rebuild
+  (`python3 docker/judge/gen_ojsec_policy.py && gcc -O2 -static -s -o
+  docker/judge/ojbin/ojsec docker/judge/ojsec.c`), redeploy `ojbin/ojsec`,
+  then prune pool containers; `tests/test_seccomp_phase_split.py` guards the
+  subset invariants and keeps the generated header in sync with the JSON.
+- Submissions can still **burn CPU/time** until timeout; file writes are
+  confined to `/sandbox` (quota-mounted) and tmpfs `/tmp`.
+- This is hardening, not a complete security audit.

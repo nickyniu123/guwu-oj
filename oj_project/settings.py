@@ -68,12 +68,12 @@ INSTALLED_APPS = [
     'handbook',
     'mathfilters',
     'search',
-    'django_rq',
     'django_ratelimit',
     'django_prometheus',
     'health',
     'devlog',
     'ai_assistant',
+    'tickets',
 ]
 
 if not TEST_MODE:
@@ -152,38 +152,35 @@ def _parse_judge_machines(raw, fallback):
         raise ValueError('JUDGE_MACHINES_JSON must be a non-empty JSON array')
 
     validated = []
-    queues = set()
+    names = set()
     for index, machine in enumerate(machines, start=1):
         if not isinstance(machine, dict):
             raise ValueError(f'JUDGE_MACHINES_JSON item {index} must be an object')
 
         name = machine.get('name')
         host = machine.get('host')
-        queue = machine.get('queue')
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f'JUDGE_MACHINES_JSON item {index} requires a non-empty name')
         if not isinstance(host, str) or not host.strip():
             raise ValueError(f'JUDGE_MACHINES_JSON item {index} requires a non-empty host')
-        if not isinstance(queue, str) or not queue.strip():
-            raise ValueError(f'JUDGE_MACHINES_JSON item {index} requires a non-empty queue')
         name = name.strip()
         host = host.strip()
-        queue = queue.strip()
-        if queue in queues:
-            raise ValueError(f'JUDGE_MACHINES_JSON has duplicate queue: {queue}')
-        queues.add(queue)
+        if name in names:
+            raise ValueError(f'JUDGE_MACHINES_JSON has duplicate name: {name}')
+        names.add(name)
+        # Legacy ``queue`` / ``weight`` keys from old per-machine RQ configs
+        # are silently ignored; dispatch uses the single central Celery queue.
 
         try:
             port = int(machine.get('port', 6379))
             db = int(machine.get('db', 0))
-            weight = int(machine.get('weight', 1))
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f'JUDGE_MACHINES_JSON item {index} has invalid port, db, or weight'
+                f'JUDGE_MACHINES_JSON item {index} has invalid port or db'
             ) from exc
-        if not 1 <= port <= 65535 or db < 0 or weight < 1:
+        if not 1 <= port <= 65535 or db < 0:
             raise ValueError(
-                f'JUDGE_MACHINES_JSON item {index} has out-of-range port, db, or weight'
+                f'JUDGE_MACHINES_JSON item {index} has out-of-range port or db'
             )
 
         enabled = machine.get('enabled', True)
@@ -219,9 +216,7 @@ def _parse_judge_machines(raw, fallback):
             'host': host,
             'port': port,
             'db': db,
-            'queue': queue,
             'enabled': enabled,
-            'weight': weight,
             'tls': tls,
             'password': password,
             'ca_cert_path': ca_cert_path.strip(),
@@ -248,8 +243,8 @@ def _redis_tls_kwargs(enabled, ca_cert_path, client_cert_path='', client_key_pat
     return kwargs
 
 
-def _rq_machine_connection(machine):
-    """Return Redis client settings for one queue without exposing credentials in URLs."""
+def _judge_redis_connection_kwargs(machine):
+    """TLS/socket kwargs for a judge-broker Redis connection (no credentials in URLs)."""
     tls_enabled = machine.get('tls', _env_enabled('RQ_REDIS_TLS'))
     ca_cert_path = machine.get(
         'ca_cert_path', os.environ.get('RQ_REDIS_CA_CERT', '/etc/redis/tls/ca.crt')
@@ -260,10 +255,11 @@ def _rq_machine_connection(machine):
     client_key_path = machine.get(
         'client_key_path', os.environ.get('RQ_REDIS_CLIENT_KEY', '')
     )
-    password = machine.get('password') or _rq_redis_password()
+    password = machine.get('password') or _judge_redis_password()
     kwargs = {
         'socket_connect_timeout': 5,
-        # RQ's blocking pub/sub listener must not inherit a short read timeout.
+        # The blocking pub/sub listener (WS status push) must not inherit a
+        # short read timeout.
         # Health and load-balancer clients explicitly set their own 3-second
         # timeout in JudgeLoadBalancer._machine_redis.
         'socket_timeout': None,
@@ -277,7 +273,10 @@ def _rq_machine_connection(machine):
     return kwargs
 
 
-def _rq_redis_password():
+def _judge_redis_password():
+    # NOTE: ``RQ_REDIS_*`` are legacy env-var names kept for operational
+    # continuity (web/judge .env files); they configure the judge-broker
+    # Redis now consumed by Celery, not the removed RQ framework.
     password = os.environ.get('RQ_REDIS_PASSWORD', '')
     if DEMO_MODE or TEST_MODE:
         return password
@@ -303,29 +302,6 @@ def _redis_url(host, port, db, password='', tls=False, ca_cert_path=''):
     return url
 
 
-def _rq_redis_kwargs():
-    return _rq_machine_connection({})
-
-
-def _rq_queue_entry(machine):
-    connection = _rq_machine_connection(machine)
-    client_kwargs = {
-        key: value for key, value in connection.items()
-        if key not in {'password', 'ssl', 'ssl_cert_reqs'}
-    }
-    return {
-        'HOST': machine['host'],
-        'PORT': machine['port'],
-        'DB': machine['db'],
-        'PASSWORD': connection.get('password'),
-        'SSL': connection.get('ssl', False),
-        'SSL_CERT_REQS': connection.get('ssl_cert_reqs', 'required'),
-        'REDIS_CLIENT_KWARGS': client_kwargs,
-        'DEFAULT_TIMEOUT': 3600,
-        'WORKER_CLASS': 'oj_project.customrq.AutoReconnectWorker',
-    }
-
-
 if not DEMO_MODE:
     redis_host = os.environ.get('CACHE_REDIS_HOST', '127.0.0.1')
     redis_port = int(os.environ.get('CACHE_REDIS_PORT', '6379'))
@@ -339,8 +315,6 @@ if not DEMO_MODE:
     CACHE_REDIS_DIRECT_CONNECTION_KWARGS = _redis_tls_kwargs(
         cache_redis_tls, cache_redis_ca_cert, direct=True,
     )
-    RQ_REDIS_CONNECTION_KWARGS = _rq_redis_kwargs()
-
     cache_options = {
         'CLIENT_CLASS': 'django_redis.client.DefaultClient',
         'SOCKET_KEEPALIVE': True,
@@ -360,28 +334,16 @@ if not DEMO_MODE:
         }
     }
 
-    # The web process connects to the judge Redis endpoint; the judge worker
-    # connects to the same endpoint through loopback. Keep these deployment
-    # addresses outside source control so both hosts can run one revision.
-    rq_host = os.environ.get('RQ_REDIS_HOST', '127.0.0.1')
-    rq_port = int(os.environ.get('RQ_REDIS_PORT', '6379'))
-    rq_db = int(os.environ.get('RQ_REDIS_DB', '0'))
-    judge_1_host = os.environ.get('JUDGE_1_HOST', rq_host)
-    judge_1_port = int(os.environ.get('JUDGE_1_PORT', str(rq_port)))
-    judge_1_db = int(os.environ.get('JUDGE_1_REDIS_DB', str(rq_db)))
-
-    default_rq_machine = {
-        'host': rq_host,
-        'port': rq_port,
-        'db': rq_db,
-    }
-    RQ_QUEUES = {
-        'default': _rq_queue_entry(default_rq_machine),
-        'high': _rq_queue_entry(default_rq_machine),
-        'low': _rq_queue_entry(default_rq_machine),
-        # Lowest-priority lane for AI-explanation judge-tool verification runs.
-        'ai': _rq_queue_entry(default_rq_machine),
-    }
+    # Judge-broker Redis endpoint (``RQ_REDIS_*`` are legacy names kept for
+    # operational continuity): the web process talks to it directly; the
+    # judge worker connects through loopback. Addresses stay outside source
+    # control so both hosts run one revision.
+    broker_host = os.environ.get('RQ_REDIS_HOST', '127.0.0.1')
+    broker_port = int(os.environ.get('RQ_REDIS_PORT', '6379'))
+    broker_db = int(os.environ.get('RQ_REDIS_DB', '0'))
+    judge_1_host = os.environ.get('JUDGE_1_HOST', broker_host)
+    judge_1_port = int(os.environ.get('JUDGE_1_PORT', str(broker_port)))
+    judge_1_db = int(os.environ.get('JUDGE_1_REDIS_DB', str(broker_db)))
 
     default_judge_machines = [
         {
@@ -389,11 +351,9 @@ if not DEMO_MODE:
             'host': judge_1_host,
             'port': judge_1_port,
             'db': judge_1_db,
-            'queue': 'judge-1',
             'enabled': True,
-            'weight': 1,
             'tls': _env_enabled('RQ_REDIS_TLS'),
-            'password': _rq_redis_password(),
+            'password': _judge_redis_password(),
             'ca_cert_path': os.environ.get('RQ_REDIS_CA_CERT', '/www/wwwroot/tls-judge/ca.crt'),
             'client_cert_path': os.environ.get('RQ_REDIS_CLIENT_CERT', '/www/wwwroot/tls-judge/redis.crt'),
             'client_key_path': os.environ.get('RQ_REDIS_CLIENT_KEY', '/www/wwwroot/tls-judge/redis.key'),
@@ -403,60 +363,153 @@ if not DEMO_MODE:
         os.environ.get('JUDGE_MACHINES_JSON', ''),
         default_judge_machines,
     )
-    # Local worker settings own the transport for the queue it consumes. The
-    # web process alone reads JudgeMachine database overrides for remote queues.
+    # JUDGE_MACHINES only feeds web-side health probes and the WS pub/sub
+    # subscriptions; task dispatch goes exclusively through CELERY_BROKER_URL.
 
     OJ_MULTI_JUDGE_ENABLED = os.environ.get('OJ_MULTI_JUDGE_ENABLED', 'true').lower() in ('1', 'true', 'yes')
     OJ_ROLE = os.environ.get('OJ_ROLE', 'web')
-    OJ_JUDGE_QUEUE = os.environ.get('OJ_JUDGE_QUEUE', '')
     # How many submissions one judge worker process runs in parallel (threads).
     OJ_JUDGE_CONCURRENCY = int(os.environ.get('OJ_JUDGE_CONCURRENCY', '4'))
 
-    # Judge-priority lanes consumed by the rqworker command, in drain order:
-    # {base}-pro > {base}-plus > {base} (free users) > {base}-ai. django-rq
-    # resolves every CLI queue name through RQ_QUEUES and raises KeyError for
-    # an unregistered name, so all four variants must exist on the worker.
-    JUDGE_PRIORITY_SUFFIXES = ('-pro', '-plus', '', '-ai')
-
-    # A judge host normally has credentials only for its own local Redis endpoint.
-    # Register that queue and its priority lanes even when its web-side
-    # JUDGE_MACHINES_JSON lives solely on the web host.
-    if OJ_ROLE == 'worker' and OJ_JUDGE_QUEUE:
-        for _suffix in JUDGE_PRIORITY_SUFFIXES:
-            RQ_QUEUES[f'{OJ_JUDGE_QUEUE}{_suffix}'] = _rq_queue_entry(default_rq_machine)
-
-    if not (OJ_ROLE == 'worker' and OJ_JUDGE_QUEUE):
-        for machine in JUDGE_MACHINES:
-            if machine.get('enabled', True):
-                for _suffix in JUDGE_PRIORITY_SUFFIXES:
-                    RQ_QUEUES[f'{machine["queue"]}{_suffix}'] = _rq_queue_entry(machine)
-
-    RQ = {
-        # Pin enqueue timing explicitly rather than relying on the default,
-        # which changed in django-rq 4.0 (AUTOCOMMIT/'auto' -> 'on_db_commit').
-        # 'on_db_commit' keeps the judge task from starting before the
-        # Submission row is committed and visible to the worker.
-        # django-rq 2.x ignores this key and always enqueues immediately;
-        # django-rq 4+ returns None from enqueue() in this mode when inside a
-        # transaction, so callers must not assume a Job is returned
-        # (see submissions/judge_queue.py).
-        'COMMIT_MODE': 'on_db_commit',
-        'exception_handler': 'django_rq.handlers.sentry',
+    # ── Celery judge broker ─────────────────────────────────────────────
+    # All judge tasks go to a single logical Celery queue ``judge`` on the
+    # central Redis broker; every judge machine competes for jobs there.
+    # Priority is expressed with Redis priority buckets (kombu
+    # ``priority_steps``): a task's numeric priority p lands in bucket
+    # ``steps[bisect(steps, p) - 1]`` and buckets are BRPOP-consumed in
+    # ascending step order, so LOWER p = consumed first.
+    # Mapping (see submissions/judge_queue.py): pro=0 > plus=3 > free=6 > ai=9.
+    #
+    # JUDGE_BROKER_URL (rediss://…, with ssl_* query params) is set on judge
+    # workers and points at this host's central Redis; on the web host the
+    # broker is the local Redis described by RQ_REDIS_*.
+    broker_url = os.environ.get('JUDGE_BROKER_URL', '').strip()
+    if broker_url:
+        CELERY_BROKER_URL = broker_url
+    else:
+        CELERY_BROKER_URL = _redis_url(
+            broker_host, broker_port, broker_db, _judge_redis_password(),
+            _env_enabled('RQ_REDIS_TLS'),
+            os.environ.get('RQ_REDIS_CA_CERT', '/etc/redis/tls/ca.crt'),
+        )
+    CELERY_BROKER_TRANSPORT_OPTIONS = {
+        'queue_order_strategy': 'priority',
+        'priority_steps': [0, 3, 6, 9],
+        'sep': ':',
     }
+    CELERY_TASK_DEFAULT_QUEUE = 'judge'
+    # Free tier; see submissions/judge_queue.PRIORITY_* / celery_priority().
+    CELERY_TASK_DEFAULT_PRIORITY = 6
+    CELERY_TASK_SERIALIZER = 'json'
+    CELERY_ACCEPT_CONTENT = ['json']
+    # Results ride the project's own reliable ``judge:result`` Redis queue.
+    CELERY_TASK_IGNORE_RESULT = True
+    CELERY_TASK_TIME_LIMIT = 3600
+    # One message in flight per worker thread: prefetching more would hold
+    # high-priority jobs hostage behind a busy worker's buffer.
+    CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+    CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
+    # Claim/lease: stable worker identity (defaults to hostname) and the
+    # heartbeat cadence; the reaper reaps claims silent for ~5 min.
+    OJ_WORKER_ID = os.environ.get('OJ_WORKER_ID', '').strip()
+    OJ_JUDGE_HEARTBEAT_SECS = int(os.environ.get('OJ_JUDGE_HEARTBEAT_SECS', '15'))
+    OJ_JUDGE_LEASE_TIMEOUT_SECS = int(
+        os.environ.get('OJ_JUDGE_LEASE_TIMEOUT_SECS', '300')
+    )
+
+    # Phase 3 DB-less workers: claim/heartbeat over HTTP, results over the
+    # central Redis result list. JUDGE_INTERNAL_TOKEN authenticates worker
+    # calls to the internal API; JUDGE_API_BASE is the web origin workers
+    # call (workers only).
+    JUDGE_INTERNAL_TOKEN = os.environ.get('JUDGE_INTERNAL_TOKEN', '').strip()
+    JUDGE_API_BASE = os.environ.get('JUDGE_API_BASE', '').rstrip('/')
+    # Second origin the worker falls back to when the primary is unreachable
+    # (used by NAT'd workers whose direct-link firewall rule may be stale).
+    JUDGE_API_FALLBACK_BASE = os.environ.get(
+        'JUDGE_API_FALLBACK_BASE', '',
+    ).rstrip('/')
+    OJ_WORKER_DBLESS = _env_enabled('OJ_WORKER_DBLESS', False)
+    OJ_RESULT_QUEUE_NAME = os.environ.get('OJ_RESULT_QUEUE_NAME', 'judge:result')
+    # How often a DB-less worker re-announces its public IP (seconds). The
+    # address only changes on an ISP renumber, so this is a safety net on top
+    # of the forced report that follows a failed direct-base claim.
+    OJ_JUDGE_IP_REPORT_INTERVAL = int(
+        os.environ.get('OJ_JUDGE_IP_REPORT_INTERVAL', '600')
+    )
+
+    # Direct judge API firewall (web side). NAT'd workers report their public
+    # IP to /internal/judge/report_ip/ and the web host keeps an iptables
+    # chain in sync, so the bypass-Cloudflare link survives a dynamic IP.
+    OJ_JUDGE_DIRECT_PORT = int(os.environ.get('OJ_JUDGE_DIRECT_PORT', '8446'))
+    OJ_JUDGE_DIRECT_CHAIN = os.environ.get(
+        'OJ_JUDGE_DIRECT_CHAIN', 'JUDGE_DIRECT',
+    )
+    OJ_JUDGE_DIRECT_STATE = os.environ.get(
+        'OJ_JUDGE_DIRECT_STATE', '/etc/guwu/judge-direct-ips.json',
+    )
+    # Always-allowed sources, independent of any report: static hosts (and a
+    # safety net if the state file is lost across a reinstall).
+    OJ_JUDGE_DIRECT_STATIC_IPS = [
+        ip.strip()
+        for ip in os.environ.get(
+            'OJ_JUDGE_DIRECT_STATIC_IPS', '64.90.3.112',
+        ).split(',')
+        if ip.strip()
+    ]
+
+    # Broker chain: gates Redis (6379) + direct API (8446).  Sits in
+    # VLESS_MIN_INPUT ahead of the catch-all DROP, so it is the chain that
+    # actually matters in production.  Static IPs may include private LAN
+    # addresses (local judge workers reach Redis over the LAN).
+    OJ_JUDGE_BROKER_CHAIN = os.environ.get(
+        'OJ_JUDGE_BROKER_CHAIN', 'OJ_JUDGE_BROKER',
+    )
+    OJ_JUDGE_BROKER_PORTS = os.environ.get(
+        'OJ_JUDGE_BROKER_PORTS', '6379,8446',
+    )
+    OJ_JUDGE_BROKER_STATIC_IPS = [
+        ip.strip()
+        for ip in os.environ.get(
+            'OJ_JUDGE_BROKER_STATIC_IPS', '',
+        ).split(',')
+        if ip.strip()
+    ]
 else:
     CACHE_REDIS_CONNECTION_KWARGS = {}
     CACHE_REDIS_DIRECT_CONNECTION_KWARGS = {}
-    RQ_REDIS_CONNECTION_KWARGS = {}
     CACHES = {
         'default': {
             'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
             'LOCATION': os.path.join(tempfile.gettempdir(), 'oj_demo_cache'),
         }
     }
-    RQ_QUEUES = {}
     JUDGE_MACHINES = []
     OJ_MULTI_JUDGE_ENABLED = False
-    OJ_JUDGE_QUEUE = ''
+    # No broker in demo mode: enqueue_judge() skips dispatch entirely.
+    CELERY_BROKER_URL = None
+    CELERY_BROKER_TRANSPORT_OPTIONS = {}
+    CELERY_TASK_DEFAULT_QUEUE = 'judge'
+    CELERY_TASK_DEFAULT_PRIORITY = 6
+    CELERY_TASK_IGNORE_RESULT = True
+    OJ_WORKER_ID = ''
+    OJ_JUDGE_HEARTBEAT_SECS = 15
+    OJ_JUDGE_LEASE_TIMEOUT_SECS = 300
+    JUDGE_INTERNAL_TOKEN = ''
+    JUDGE_API_BASE = ''
+    JUDGE_API_FALLBACK_BASE = ''
+    OJ_WORKER_DBLESS = False
+    OJ_RESULT_QUEUE_NAME = 'judge:result'
+    OJ_JUDGE_IP_REPORT_INTERVAL = 600
+    OJ_JUDGE_DIRECT_PORT = 8446
+    OJ_JUDGE_DIRECT_CHAIN = 'JUDGE_DIRECT'
+    OJ_JUDGE_DIRECT_STATE = os.path.join(
+        tempfile.gettempdir(), 'judge-direct-ips.json',
+    )
+    OJ_JUDGE_DIRECT_STATIC_IPS = []
+    OJ_JUDGE_BROKER_CHAIN = 'OJ_JUDGE_BROKER'
+    OJ_JUDGE_BROKER_PORTS = '6379,8446'
+    OJ_JUDGE_BROKER_STATIC_IPS = []
 
 if DEMO_MODE:
     DATABASES = {
@@ -466,24 +519,52 @@ if DEMO_MODE:
         }
     }
 else:
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.environ.get('DB_NAME', 'ojdb'),
-            'USER': os.environ.get('DB_USER', 'ojuser'),
-            'PASSWORD': os.environ.get('DB_PASSWORD', ''),
-            'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
-            'PORT': os.environ.get('DB_PORT', '5432'),
-            'OPTIONS': {
-                'sslmode': os.environ.get('DB_SSLMODE', 'require'),
-                **(
-                    {'sslrootcert': os.environ['DB_SSLROOTCERT']}
-                    if os.environ.get('DB_SSLROOTCERT')
-                    else {}
-                ),
-            },
+    if OJ_ROLE == 'worker' and OJ_WORKER_DBLESS:
+        # Phase 3 DB-less judge worker: it never touches PostgreSQL (claims
+        # and results go through HTTP / the result queue). Give Django a
+        # inert sqlite database so framework/bootstrap code that resolves the
+        # default connection still imports cleanly; the dbless task path
+        # never queries it. The PostgreSQL credentials are deliberately
+        # absent from the deployment environment in this mode.
+        DATABASES = {
+            'default': {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': '/tmp/oj-dbless-dummy.sqlite3',
+            }
         }
-    }
+    else:
+        DATABASES = {
+            'default': {
+                'ENGINE': 'django.db.backends.postgresql',
+                'NAME': os.environ.get('DB_NAME', 'ojdb'),
+                'USER': os.environ.get('DB_USER', 'ojuser'),
+                'PASSWORD': os.environ.get('DB_PASSWORD', ''),
+                'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
+                'PORT': os.environ.get('DB_PORT', '5432'),
+                'OPTIONS': {
+                    'sslmode': os.environ.get('DB_SSLMODE', 'require'),
+                    **(
+                        {'sslrootcert': os.environ['DB_SSLROOTCERT']}
+                        if os.environ.get('DB_SSLROOTCERT')
+                        else {}
+                    ),
+                },
+                # The judge claim/heartbeat endpoints answer in ~10ms once
+                # the connection is warm, but a cold PostgreSQL connect
+                # (TCP + TLS + auth) costs ~18ms on every request while this
+                # is 0, and that lands directly on the worker's critical
+                # path. Keeping the per-thread connection alive removes it;
+                # health checks transparently replace a dropped connection.
+                # The test runner has to drop the test database, which
+                # requires every session to be gone; a persistent per-thread
+                # connection left open by a test worker thread blocks it.
+                'CONN_MAX_AGE': (
+                    0 if 'test' in sys.argv
+                    else int(os.environ.get('DB_CONN_MAX_AGE', '60'))
+                ),
+                'CONN_HEALTH_CHECKS': True,
+            }
+        }
 
 # Hostname presented to libpq for TLS certificate verification by the
 # ``pg_dump``/``psql`` CLI used for admin database backup and restore.
@@ -523,6 +604,56 @@ USE_TZ = True
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_DIRS = [BASE_DIR / 'static']
+
+# Problem-statement images uploaded from the create-problem editor. Served
+# in dev via urls.py +static(); in production nginx should alias /media/ to
+# MEDIA_ROOT (the same way /static/ is aliased to staticfiles).
+#
+# When R2 is enabled (below) both problem images and user avatars are written
+# to Cloudflare R2 instead, and nginx's /media/ alias becomes unused.
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
+# ---------------------------------------------------------------------------
+# Cloudflare R2 object storage (problem images + user avatars)
+# ---------------------------------------------------------------------------
+# R2 is an S3-compatible object store.  When the R2_* variables are present,
+# ``default_storage`` is repointed at the bucket and every media URL becomes a
+# public CDN URL served through the bucket's custom domain.  When they are
+# absent the app transparently keeps using local filesystem storage, so
+# development and the test suite need no credentials.
+#
+# These are populated by ``scripts/setup_r2.sh`` after R2 is activated on the
+# Cloudflare account (activation itself is dashboard-only).
+R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID', '')
+R2_BUCKET = os.environ.get('R2_BUCKET', '')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY', '')
+R2_CUSTOM_DOMAIN = os.environ.get('R2_CUSTOM_DOMAIN', '')
+R2_ENDPOINT_URL = os.environ.get(
+    'R2_ENDPOINT_URL',
+    f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com' if R2_ACCOUNT_ID else '',
+)
+
+R2_ENABLED = bool(
+    R2_BUCKET and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_ENDPOINT_URL
+)
+
+if R2_ENABLED:
+    STORAGES = {
+        'default': {'BACKEND': 'oj_project.storage.R2MediaStorage'},
+        # Defining STORAGES replaces Django's entire default mapping, so the
+        # staticfiles backend must be restated or WhiteNoise loses its source
+        # of truth for collectstatic / {% static %} lookups.
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    }
+    if R2_CUSTOM_DOMAIN:
+        # MEDIA_URL is only a fallback here — R2MediaStorage.url() builds
+        # absolute CDN URLs from the bucket's custom domain — but several
+        # templates and the dev static() helper read it directly.
+        MEDIA_URL = f'https://{R2_CUSTOM_DOMAIN}/'
 
 WHITENOISE_ROOT = BASE_DIR / 'static'
 WHITENOISE_USE_FINDERS = True
@@ -680,6 +811,98 @@ OJ_DOCKER_PIDS_LIMIT = int(os.environ.get('OJ_DOCKER_PIDS_LIMIT', '64'))
 OJ_DOCKER_NOFILE_LIMIT = int(os.environ.get('OJ_DOCKER_NOFILE_LIMIT', '64'))
 # The profile must be loaded on every judge host before containers are started.
 OJ_DOCKER_APPARMOR_PROFILE = os.environ.get('OJ_DOCKER_APPARMOR_PROFILE', 'oj-judge').strip()
+
+# ── cgroup resource limits (applied to every judge container) ─────────────
+# Disk I/O: relative weight (10–1000, 0 = default) + absolute caps on the
+# auto-detected root block device.  BPS accepts Docker units (50mb, 1gb);
+# IOPS are raw integers.  Empty/0 disables the respective cap.
+OJ_DOCKER_BLKIO_WEIGHT = int(os.environ.get('OJ_DOCKER_BLKIO_WEIGHT', '100'))
+OJ_DOCKER_IO_READ_BPS = os.environ.get('OJ_DOCKER_IO_READ_BPS', '50mb').strip()
+OJ_DOCKER_IO_WRITE_BPS = os.environ.get('OJ_DOCKER_IO_WRITE_BPS', '50mb').strip()
+OJ_DOCKER_IO_READ_IOPS = int(os.environ.get('OJ_DOCKER_IO_READ_IOPS', '0'))
+OJ_DOCKER_IO_WRITE_IOPS = int(os.environ.get('OJ_DOCKER_IO_WRITE_IOPS', '0'))
+# tmpfs /tmp size cap (Docker size suffix: 64m, 1g).  Empty = unlimited.
+OJ_DOCKER_TMPFS_SIZE = os.environ.get('OJ_DOCKER_TMPFS_SIZE', '64m').strip()
+# Hard size cap for each submission's bind-mounted work directory (compiler
+# artifacts + program file writes), enforced by an ext4/XFS project quota.
+# Requires the backing fs mounted with prjquota (ext4) / pquota (XFS) and
+# the chattr + setquota tools; otherwise it logs a warning and stays inert.
+# 0 disables. See submissions/work_quota.py.
+OJ_WORKDIR_SIZE_LIMIT_MB = int(os.environ.get('OJ_WORKDIR_SIZE_LIMIT_MB', '1024'))
+OJ_QUOTA_PROJECT_ID_FILE = os.environ.get(
+    'OJ_QUOTA_PROJECT_ID_FILE', '/var/lib/guwu-oj/workdir.prjnext'
+)
+# Maximum stdout/stderr bytes captured from a single compile or execute
+# step. Excess is drained (so the child never blocks on a full pipe) but
+# discarded; an over-limit run is judged Runtime Error ("Output limit
+# exceeded"). Bounds worker RAM regardless of what the sandbox prints.
+# 0 disables the cap. See run_capture_bounded() in submissions/sandbox.py.
+OJ_OUTPUT_LIMIT_BYTES = int(
+    os.environ.get('OJ_OUTPUT_LIMIT_BYTES', str(16 * 1024 * 1024))
+)
+# Soft memory reclaim point as a fraction of the hard --memory cap (0–1).
+# 0 disables; 0.75 means the kernel starts reclaiming at 75 % of the hard
+# limit, giving a softer degradation before the OOM kill.  This is the
+# "extra" memory cgroup limit, kept alongside the existing hard cap.
+OJ_DOCKER_MEMORY_RESERVATION_FRACTION = float(
+    os.environ.get('OJ_DOCKER_MEMORY_RESERVATION_FRACTION', '0.75')
+)
+# CPU: quota in cores (1.0 = one full core, 0 = unlimited) + relative
+# shares (2–262144, default 1024; 0 = default).  Low shares deprioritise
+# judge containers against host workloads.
+OJ_DOCKER_CPU_LIMIT = os.environ.get('OJ_DOCKER_CPU_LIMIT', '1.0').strip()
+OJ_DOCKER_CPU_SHARES = int(os.environ.get('OJ_DOCKER_CPU_SHARES', '256'))
+
+# ── Warm per-language judge container pool (judge workers only) ──────────
+# A pool of long-lived `sleep infinity` containers is maintained per judge
+# image on each worker, so submissions skip the ~0.5-1.5s `docker run`
+# startup overhead. Queue layout and OJ_JUDGE_CONCURRENCY are unaffected.
+OJ_CONTAINER_POOL_ENABLED = os.environ.get(
+    'OJ_CONTAINER_POOL_ENABLED', 'true'
+).lower() in ('1', 'true', 'yes')
+# Idle containers kept warm per image (the maintainer refills on checkout).
+OJ_CONTAINER_POOL_MIN_IDLE = int(os.environ.get('OJ_CONTAINER_POOL_MIN_IDLE', '1'))
+# Max live containers (idle + in-use) per image. 0/empty = concurrency +
+# min-idle, which guarantees a warm spare while every thread is busy.
+OJ_CONTAINER_POOL_MAX_SIZE = int(
+    os.environ.get('OJ_CONTAINER_POOL_MAX_SIZE', '0')
+) or None
+# Initial cgroup cap of a pooled container. Each checkout is resized via
+# `docker update` to max(problem memory limit, 512), so this only needs to
+# cover the idle keepalive; it's a cap, not a reserve.
+OJ_CONTAINER_POOL_MEMORY_MB = int(os.environ.get('OJ_CONTAINER_POOL_MEMORY_MB', '1024'))
+# Recycle a pooled container after this many submissions / seconds of life.
+OJ_CONTAINER_POOL_MAX_USES = int(os.environ.get('OJ_CONTAINER_POOL_MAX_USES', '50'))
+OJ_CONTAINER_POOL_MAX_AGE_SEC = int(os.environ.get('OJ_CONTAINER_POOL_MAX_AGE_SEC', '3600'))
+# Extra warm containers left by a burst are reaped after this many idle seconds.
+OJ_CONTAINER_POOL_IDLE_TTL_SEC = int(os.environ.get('OJ_CONTAINER_POOL_IDLE_TTL_SEC', '300'))
+# Max wait for a free pooled container before falling back to an ephemeral one.
+OJ_CONTAINER_POOL_ACQUIRE_TIMEOUT = int(
+    os.environ.get('OJ_CONTAINER_POOL_ACQUIRE_TIMEOUT', '15')
+)
+# Host directory whose per-container subfolders are bind-mounted at /sandbox.
+OJ_CONTAINER_POOL_WORK_ROOT = os.environ.get(
+    'OJ_CONTAINER_POOL_WORK_ROOT', '/tmp/oj_container_pool'
+)
+
+# ── Shared compiler cache (ccache) ───────────────────────────────────────
+# Host directory bind-mounted read/write into the compiled-language judge
+# containers as /ccache. One directory per host, shared by every container and
+# surviving container recycling, so a compilation that has been seen before is
+# served from cache instead of running g++ again. Empty string disables it.
+OJ_CCACHE_DIR = os.environ.get('OJ_CCACHE_DIR', '/var/cache/oj-judge-ccache').strip()
+# Upper bound on the cache size on disk, enforced by ccache itself.
+OJ_CCACHE_MAX_SIZE = os.environ.get('OJ_CCACHE_MAX_SIZE', '5G').strip()
+
+# ── Judge-side test data cache ───────────────────────────────────────────
+# A DB-less worker files the test data it downloads under the content
+# fingerprint the claim carried, so a later submission of the same problem is
+# judged without re-pulling tens of megabytes over the (narrow) web uplink.
+# Entries are dropped oldest-first once the cap below is reached; an empty
+# directory disables the cache entirely.
+OJ_CASE_CACHE_DIR = os.environ.get('OJ_CASE_CACHE_DIR', '/var/cache/oj-judge-cases').strip()
+OJ_CASE_CACHE_MAX_SIZE = os.environ.get('OJ_CASE_CACHE_MAX_SIZE', '20G').strip()
+
 # Default subprocess timeout (can be overridden via JudgeConfig model in admin)
 OJ_SUBPROCESS_TIMEOUT_SEC = int(os.environ.get('OJ_SUBPROCESS_TIMEOUT_SEC', '5'))
 
@@ -902,6 +1125,14 @@ SIMPLEUI_CONFIG = {
                  'url': '/admin/ai_assistant/aitoolcall/'},
                 {'name': '订阅计费配置', 'icon': 'fas fa-credit-card',
                  'url': '/admin/ai_assistant/billingconfig/'},
+            ],
+        },
+        {
+            'name': '工单反馈',
+            'icon': 'fas fa-life-ring',
+            'models': [
+                {'name': '工单', 'icon': 'fas fa-ticket-alt',
+                 'url': '/admin/tickets/ticket/'},
             ],
         },
         {

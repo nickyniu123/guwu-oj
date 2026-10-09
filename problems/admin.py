@@ -7,7 +7,7 @@ from django.urls import path
 
 from ai_assistant.deepseek_api import DeepSeekError
 
-from .forms import save_test_cases
+from .forms import ProblemAdminForm, save_test_cases
 from .luogu import LuoguFetchError, fetch_luogu_problem, normalize_pid
 from .models import Problem, TestCase, Solution
 from .tag_complete import (
@@ -20,6 +20,17 @@ from .tag_complete import (
     save_prompts,
 )
 from .tag_labels import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from .tag_complete import (
+    MAX_BATCH,
+    collect_vocabulary,
+    complete_problems_in_parallel,   # 新增
+    count_incomplete_problems,
+    incomplete_problems,
+    load_saved_prompts,
+    save_prompts,
+)
+
+TAG_STEP_BATCH = 10
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +42,39 @@ class TestCaseInline(admin.TabularInline):
 
 @admin.register(Problem)
 class ProblemAdmin(admin.ModelAdmin):
-    list_display = ['id', 'title', 'luogu_pid', 'difficulty', 'created_by', 'is_public', 'created_at']
-    list_filter = ['difficulty', 'is_public', 'created_at']
+    list_display = ['id', 'title', 'luogu_pid', 'problem_type', 'difficulty', 'created_by', 'is_public', 'created_at']
+    list_filter = ['problem_type', 'difficulty', 'is_public', 'created_at']
     search_fields = ['title', 'description', 'tags', 'luogu_pid']
-    readonly_fields = ['luogu_pid']
+    readonly_fields = ['luogu_pid', 'created_at', 'updated_at']
+    fieldsets = (
+        (None, {
+            'fields': ('title', 'description', 'input_format', 'output_format',
+                       'sample_input', 'sample_output', 'hint', 'tags',
+                       'luogu_pid'),
+        }),
+        ('题目类型', {
+            'fields': ('problem_type', 'function_files', 'interactive_config'),
+            'description': '函数题（IOI 风格）请把 problem_type 设为 function，并在 function_files '
+                           '填 JSON 数组，例如 [{"name": "problem.h", "content": "..."}, '
+                           '{"name": "grader.cpp", "content": "..."}]。'
+                           '交互题（IOI 风格）把 problem_type 设为 interactive，function_files 放 '
+                           'manager/stub 等文件，interactive_config 填 JSON 对象，例如 '
+                           '{"num_processes": 1, "user_io": "fifo_io"}。标准题忽略这两个字段。',
+        }),
+        ('评测限制', {
+            'fields': ('difficulty', 'time_limit', 'memory_limit', 'is_public'),
+        }),
+        ('元数据', {
+            'fields': ('created_by', 'created_at', 'updated_at'),
+        }),
+    )
     inlines = [TestCaseInline]
     change_list_template = 'admin/problems/problem/change_list.html'
+    form = ProblemAdminForm
+
+    class Media:
+        css = {'all': ('css/md-toolbar-v2.css',)}
+        js = ('js/md-toolbar.js', 'js/md-toolbar-admin-init.js')
 
     def get_urls(self):
         urls = super().get_urls()
@@ -175,8 +213,10 @@ class ProblemAdmin(admin.ModelAdmin):
     def complete_tags_step(self, request):
         if request.method != 'POST':
             return JsonResponse({'ok': False, 'error': '请使用 POST。'}, status=405)
+
         api_key = request.session.get('tag_complete_api_key') or ''
         ids = list(request.session.get('tag_complete_ids') or [])
+
         if not api_key:
             return JsonResponse(
                 {'ok': False, 'error': '会话已过期，请重新填写 API Key。'},
@@ -185,49 +225,71 @@ class ProblemAdmin(admin.ModelAdmin):
         if not ids:
             request.session.pop('tag_complete_api_key', None)
             request.session.modified = True
-            return JsonResponse({'ok': True, 'done': True, 'remaining': 0})
-        problem_id = ids[0]
-        problem = Problem.objects.filter(pk=problem_id).first()
-        if problem is None:
-            ids.pop(0)
-            request.session['tag_complete_ids'] = ids
-            request.session.modified = True
-            return JsonResponse({
-                'ok': False,
-                'done': not ids,
-                'remaining': len(ids),
-                'error': f'题目 P{problem_id} 不存在。',
-                'problem_id': problem_id,
-            })
+            return JsonResponse(
+                {'ok': True, 'done': True, 'remaining': 0, 'results': []}
+            )
+
+        batch_ids = ids[:TAG_STEP_BATCH]
+        rest_ids = ids[TAG_STEP_BATCH:]
+
+        # 保持原有顺序，同时容忍中途被删掉的题
+        problem_map = Problem.objects.in_bulk(batch_ids)
+        problems: list[Problem] = []
+        missing: list[int] = []
+        for pid in batch_ids:
+            problem = problem_map.get(pid)
+            if problem is None:
+                missing.append(pid)
+            else:
+                problems.append(problem)
+
         vocab = request.session.get('tag_complete_vocab') or collect_vocabulary()
         system_prompt = request.session.get('tag_complete_system_prompt') or ''
         user_prompt = request.session.get('tag_complete_user_prompt') or ''
-        try:
-            result = complete_one_problem(
-                problem, vocab, api_key=api_key,
+
+        results: list[dict] = []
+        if problems:
+            # 单题内部已用 try/finally 关闭线程本地连接；
+            # 这里的 concurrency 与 batch_size 保持一致，避免空闲线程。
+            results = complete_problems_in_parallel(
+                problems,
+                vocab,
+                api_key=api_key,
                 system_prompt=system_prompt,
                 user_prompt_template=user_prompt,
+                concurrency=min(TAG_STEP_BATCH, len(problems)),
             )
-        except DeepSeekError as exc:
-            logger.warning('DeepSeek tag complete failed for P%s', problem_id)
-            return JsonResponse({
+
+        for pid in missing:
+            results.append({
                 'ok': False,
-                'done': False,
-                'remaining': len(ids),
-                'problem_id': problem_id,
-                'title': problem.title,
-                'error': exc.user_message,
+                'problem_id': pid,
+                'title': '',
+                'error': f'题目 P{pid} 不存在。',
+                'before': '',
+                'after': '',
+                'added': [],
             })
-        ids.pop(0)
-        request.session['tag_complete_ids'] = ids
+
+        # 并行返回乱序，按提交顺序排回去，方便前端打印
+        order = {pid: i for i, pid in enumerate(batch_ids)}
+        results.sort(key=lambda r: order.get(r.get('problem_id'), 0))
+
+        request.session['tag_complete_ids'] = rest_ids
         request.session.modified = True
-        result['done'] = not ids
-        result['remaining'] = len(ids)
-        if result['done']:
+
+        done = not rest_ids
+        if done:
             request.session.pop('tag_complete_api_key', None)
             request.session.pop('tag_complete_vocab', None)
             request.session.modified = True
-        return JsonResponse(result)
+
+        return JsonResponse({
+            'ok': True,
+            'done': done,
+            'remaining': len(rest_ids),
+            'results': results,
+        })
 
 
 @admin.register(TestCase)

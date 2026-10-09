@@ -23,6 +23,31 @@ profile oj-judge flags=(attach_disconnected) {
   /sandbox/ r,
 
 
+  # Shared ccache directory, bind-mounted from the judge host and reused by
+  # every judge container on that host. Read/write/lock only: no execute, so
+  # the cache can never become an alternate launch path for a submission.
+  /ccache/ rw,
+  /ccache/** rwmk,
+
+  # Precompiled C++ standard library header baked into the oj-cpp image;
+  # g++ only ever reads it (mmap), never writes.
+  /pch/ r,
+  /pch/** rm,
+
+  # ojrun: static per-case timing wrapper bind-mounted read-only from the
+  # judge host (replaces /usr/bin/time with µs-resolution wall clock +
+  # wait4 rusage). Execute-only launch path; the mount itself is ro.
+  /opt/oj/ r,
+  /opt/oj/** rix,
+
+
+  # A login shell runs the timed test command and sources /etc/profile, whose
+  # Debian default loops over /etc/profile.d/*.sh. Denying that turned every
+  # test case into audit-log denials.
+  /etc/profile.d/ rix,
+  /etc/profile.d/** r,
+
+
 
   # Allow read access to system libraries
 
@@ -56,6 +81,11 @@ profile oj-judge flags=(attach_disconnected) {
   # Java must read java.security before either javac or java can start.
   /etc/java-17-openjdk/** r,
 
+  # kotlinc lives under /usr/share/kotlin (launcher scripts + jars); the
+  # broad /usr/share read rule above does not grant execute, so the
+  # launcher path needs its own ix rule.
+  /usr/share/kotlin/** rix,
+
 
 
   # Allow read access to locale and timezone data
@@ -86,7 +116,9 @@ profile oj-judge flags=(attach_disconnected) {
   /proc/*/coredump_filter rw,
 
   # Docker's PID namespace hides host processes; allow procfs reads needed by
-  # managed runtimes while ptrace and signal remain prohibited below.
+  # managed runtimes and by the container-pool sanitiser, which enumerates
+  # tasks with a /proc/[0-9]* glob (readdir needs the directory itself).
+  /proc/ r,
   /proc/** r,
 
 
@@ -143,10 +175,19 @@ profile oj-judge flags=(attach_disconnected) {
 
 
 
-  # Docker/runc runs unconfined and must be able to terminate a judge process.
-  # Keep submissions from signalling another confined judge container.
+  # Signalling policy.
+  #
+  # runc / dockerd are unconfined and must be able to terminate judge tasks
+  # (host-side timeouts, ``docker kill`` on pool recycle).
   signal (receive) peer=unconfined,
-  deny signal peer=oj-judge,
+  #
+  # Processes inside ONE container may signal each other. Without this the
+  # profile denied kill() between its own tasks, silently disabling the
+  # compile-step ``timeout 1``, ojrun/TLE termination, interactive
+  # ``timeout -k``, and the pool sanitiser's stray-process kill. Signalling
+  # ANOTHER container stays impossible regardless of this rule: every
+  # container owns a separate PID namespace, so foreign PIDs are unaddressable.
+  signal peer=oj-judge,
 
 
 
